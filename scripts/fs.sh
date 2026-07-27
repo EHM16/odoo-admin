@@ -41,6 +41,16 @@ fs_mkdir() {
 
 }
 
+fs_mkdir_new() {
+
+    local directory="${1:-}"
+
+    _fs_check_arguments "$directory" || return 1
+
+    mkdir -- "$directory"
+
+}
+
 fs_is_writable() {
 
     local directory="${1:-}"
@@ -289,12 +299,29 @@ fs_move_no_replace() {
     # concurrent publisher wins. The caller creates source beside destination,
     # so both paths are guaranteed to be on the same filesystem.
     ln -- "$source" "$destination" || return 1
-    rm -- "$source" || {
-        rm -- "$destination"
-        return 1
+    _fs_unlink "$source" || {
+        if _fs_unlink "$destination"; then
+            printf \
+                'fs: publication cleanup failed; destination rolled back: source=%q destination=%q\n' \
+                "$source" "$destination" >&2
+            return 1
+        fi
+        printf \
+            'fs: publication cleanup and rollback failed; both names reference the same complete file: source=%q destination=%q\n' \
+            "$source" "$destination" >&2
+        return 2
     }
 
     fs_exists "$destination"
+
+}
+
+_fs_unlink() {
+
+    local path="${1:-}"
+
+    _fs_check_arguments "$path" || return 1
+    rm -- "$path"
 
 }
 

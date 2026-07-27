@@ -122,7 +122,10 @@ archive_extract /var/backups/odoo/filesystem.oaa /ruta/de/restauracion
 ```
 
 La extracción conserva la raíz lógica `resources/` para que cada recurso pueda
-identificarse sin depender de su ruta original.
+identificarse sin depender de su ruta original. El destino debe ser inexistente:
+la operación lo crea y lo elimina si la extracción falla. Esta precondición
+evita mezclar un respaldo con datos anteriores, enlaces simbólicos o una
+extracción parcial.
 
 ## Manifiesto
 
@@ -139,6 +142,10 @@ identificarse sin depender de su ruta original.
 
 Los valores se serializan como JSON válido, incluidos nombres y rutas con
 espacios, comillas o caracteres que requieren escape.
+
+Los nombres de archivo con saltos de línea o retornos de carro se rechazan
+durante la creación. OAA 1.0 no los admite porque sus herramientas de
+inspección deben conservar una interpretación inequívoca de cada miembro.
 
 La ruta absoluta de origen se conserva deliberadamente como dato de
 trazabilidad. Por ello, el manifiesto puede revelar rutas internas del servidor:
@@ -222,9 +229,17 @@ git diff --check
 - Los fallos intermedios eliminan los archivos temporales.
 - La verificación exige un único `manifest.json`, JSON y versión compatibles,
   raíz `resources/`, nombres lógicos únicos, rutas internas seguras y
-  correspondencia entre recursos declarados e incluidos.
-- `archive_extract` ejecuta esa verificación como precondición y no reemplaza
-  archivos preexistentes en el destino.
+  correspondencia exacta entre recursos declarados e incluidos. También valida
+  invariantes internos del manifiesto, tipos conocidos y destinos seguros de
+  enlaces simbólicos y enlaces duros dentro de cada recurso lógico.
+- `archive_manifest` y `archive_extract` sólo operan sobre un OAA que supera la
+  verificación completa.
+- `archive_extract` exige un destino inexistente para impedir resultados
+  mezclados.
+- Si la publicación crea el nombre final pero no puede retirar el provisional,
+  intenta revertir el nombre final. Si también falla el rollback, devuelve un
+  estado distinto y conserva ambos nombres apuntando al mismo archivo completo;
+  nunca oculta el error secundario ni deja contenido parcial.
 
 Estas garantías reducen el riesgo de conservar respaldos parciales. Aun así, la
 verificación técnica de un archivo no reemplaza una restauración periódica de

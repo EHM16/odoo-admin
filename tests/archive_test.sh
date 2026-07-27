@@ -56,6 +56,8 @@ setup() {
     chmod 640 "${TEST_DIRECTORY}/source one/file with spaces.txt"
     touch -t 202401020304 "${TEST_DIRECTORY}/source one/file with spaces.txt"
     ln -s "file with spaces.txt" "${TEST_DIRECTORY}/source one/link"
+    ln "${TEST_DIRECTORY}/source one/file with spaces.txt" \
+        "${TEST_DIRECTORY}/source one/hardlink"
 }
 
 test_create_file() {
@@ -67,17 +69,13 @@ test_create_file() {
         archive_verify "$archive"
 }
 
-test_create_symlink_resource() {
+test_rejects_escaping_symlink_resource() {
     local archive="${TEST_DIRECTORY}/symlink.oaa"
-    local manifest
 
-    archive_create \
+    ! archive_create \
         "$archive" \
-        link "${TEST_DIRECTORY}/source one/link" || return 1
-
-    manifest=$(archive_manifest "$archive") || return 1
-
-    grep -q '"type":[[:space:]]*"symlink"' <<< "$manifest"
+        link "${TEST_DIRECTORY}/source one/link" &&
+        [[ ! -e "$archive" ]]
 }
 
 test_create_directory_and_multiple_sources() {
@@ -92,6 +90,7 @@ test_create_directory_and_multiple_sources() {
     listing=$(tar --list --zstd --file="$archive") || return 1
 
     grep -q '^resources/first/empty directory/$' <<< "$listing" &&
+        grep -q '^resources/first/hardlink$' <<< "$listing" &&
         grep -q '^resources/first/link$' <<< "$listing" &&
         grep -q '^resources/second/other.txt$' <<< "$listing"
 }
@@ -159,6 +158,19 @@ test_list_manifest_verify_extract() {
     [[ "$mode" == "640" && "$timestamp" == "$source_timestamp" ]]
 }
 
+test_extract_requires_absent_destination() {
+    local archive="${TEST_DIRECTORY}/extract-destination.oaa"
+    local destination="${TEST_DIRECTORY}/occupied"
+
+    archive_create "$archive" one "${TEST_DIRECTORY}/single file.txt" || return 1
+    mkdir "$destination"
+    printf 'keep\n' > "${destination}/existing"
+
+    ! archive_extract "$archive" "$destination" &&
+        [[ $(<"${destination}/existing") == "keep" ]] &&
+        [[ ! -e "${destination}/resources" ]]
+}
+
 test_corrupt_archive() {
     local archive="${TEST_DIRECTORY}/corrupt.oaa"
 
@@ -224,7 +236,7 @@ test_required_missing_diagnostic() {
 
 test_json_special_characters() {
     local archive="${TEST_DIRECTORY}/json.oaa"
-    local source="${TEST_DIRECTORY}/quote\" slash\\ tab"$'\t'" line"$'\n'"return"$'\r'" utf8-á"
+    local source="${TEST_DIRECTORY}/quote\" slash\\ tab"$'\t'" utf8-á"
 
     printf 'special\n' > "$source"
     PRODUCT_NAME=$'Odoo "Admin"\\\t\n\r\001 UTF-8 á'
@@ -233,6 +245,17 @@ test_json_special_characters() {
     archive_create "$archive" special "$source" || return 1
     archive_manifest "$archive" |
         python3 -c 'import json,sys; data=json.load(sys.stdin); assert "á" in data["framework"]'
+}
+
+test_rejects_source_name_with_newline() {
+    local source="${TEST_DIRECTORY}/newline-source"
+    local archive="${TEST_DIRECTORY}/newline.oaa"
+
+    mkdir "$source"
+    printf 'unsafe\n' > "${source}/line"$'\n'"break"
+
+    ! archive_create "$archive" unsafe "$source" &&
+        [[ ! -e "$archive" ]]
 }
 
 make_test_archive() {
@@ -312,6 +335,114 @@ test_declared_resource_absent() {
     ! archive_verify "$archive"
 }
 
+test_rejects_undeclared_physical_resource() {
+    local archive="${TEST_DIRECTORY}/undeclared.oaa"
+    local root="${TEST_DIRECTORY}/undeclared"
+
+    mkdir -p "$root/resources/injected"
+    printf 'injected\n' > "$root/resources/injected/payload"
+    printf '%s\n' \
+        '{"format":"OAA","version":"1.0","resources":[]}' \
+        > "$root/manifest.json"
+    make_test_archive "$archive" "$root"
+
+    ! archive_verify "$archive"
+}
+
+test_rejects_invalid_manifest_invariants() {
+    local archive="${TEST_DIRECTORY}/manifest-invariants.oaa"
+    local root="${TEST_DIRECTORY}/manifest-invariants"
+    local item
+
+    mkdir -p "$root/resources"
+
+    for item in \
+        '{"name":"x","source":7,"archive_path":"resources/x","type":"missing","required":false,"included":false,"size":0,"entries":0}' \
+        '{"name":"x","source":"/x","archive_path":"resources/x","type":7,"required":false,"included":false,"size":0,"entries":0}' \
+        '{"name":"x","source":"/x","archive_path":"resources/x","type":"file","required":false,"included":false,"size":0,"entries":0}' \
+        '{"name":"x","source":"/x","archive_path":"resources/x","type":"missing","required":true,"included":false,"size":0,"entries":0}' \
+        '{"name":"x","source":"/x","archive_path":"resources/x","type":"missing","required":false,"included":false,"size":1,"entries":0}' \
+        '{"name":"x","source":"/x","archive_path":"resources/x","type":"unknown","required":false,"included":true,"size":0,"entries":1}' \
+        '{"name":"x","source":"/x","archive_path":"resources/x","type":"missing","required":false,"included":true,"size":0,"entries":1}'
+    do
+        printf '{"format":"OAA","version":"1.0","resources":[%s]}\n' "$item" \
+            > "$root/manifest.json"
+        rm -rf -- "$root/resources"
+        mkdir -p "$root/resources/x"
+        make_test_archive "$archive" "$root"
+        ! archive_verify "$archive" || return 1
+    done
+}
+
+make_link_archive() {
+    local archive="$1"
+    local kind="$2"
+    local target="$3"
+    local tar_file="${archive}.tar"
+
+    python3 - "$tar_file" "$kind" "$target" <<'PY'
+import io
+import json
+import sys
+import tarfile
+
+tar_path, kind, target = sys.argv[1:]
+manifest = {
+    "format": "OAA",
+    "version": "1.0",
+    "resources": [{
+        "name": "safe",
+        "source": "/source",
+        "archive_path": "resources/safe",
+        "type": "directory",
+        "required": True,
+        "included": True,
+        "size": 0,
+        "entries": 1,
+    }],
+}
+with tarfile.open(tar_path, "w") as archive:
+    payload = json.dumps(manifest).encode()
+    info = tarfile.TarInfo("manifest.json")
+    info.size = len(payload)
+    archive.addfile(info, io.BytesIO(payload))
+    root = tarfile.TarInfo("resources")
+    root.type = tarfile.DIRTYPE
+    archive.addfile(root)
+    resource = tarfile.TarInfo("resources/safe")
+    resource.type = tarfile.DIRTYPE
+    archive.addfile(resource)
+    link = tarfile.TarInfo("resources/safe/link")
+    link.type = tarfile.SYMTYPE if kind == "symlink" else tarfile.LNKTYPE
+    link.linkname = target
+    archive.addfile(link)
+PY
+    zstd --quiet --stdout "$tar_file" > "$archive"
+}
+
+test_rejects_unsafe_link_targets() {
+    local archive="${TEST_DIRECTORY}/unsafe-link.oaa"
+    local kind
+    local target
+    local other_resource
+
+    for kind in symlink hardlink; do
+        if [[ "$kind" == "symlink" ]]; then
+            other_resource="../other/file"
+        else
+            other_resource="resources/other/file"
+        fi
+        for target in \
+            "/etc/passwd" \
+            "../../escape" \
+            "$other_resource"
+        do
+            make_link_archive "$archive" "$kind" "$target" || return 1
+            ! archive_verify "$archive" || return 1
+        done
+    done
+}
+
 test_concurrent_publication() {
     local archive="${TEST_DIRECTORY}/concurrent.oaa"
     local status_one="${TEST_DIRECTORY}/status-one"
@@ -324,14 +455,62 @@ test_concurrent_publication() {
     wait "$pid_one"
     wait "$pid_two"
 
-    [[ $(( $(<"$status_one") + $(<"$status_two") )) -eq 1 ]] &&
-        archive_verify "$archive"
+    [[ $(( $(<"$status_one") + $(<"$status_two") )) -eq 1 ]] || return 1
+    archive_verify "$archive" || return 1
+
+    local winner
+    winner=$(archive_list "$archive") || return 1
+    local destination="${TEST_DIRECTORY}/concurrent-extract"
+    archive_extract "$archive" "$destination" || return 1
+
+    case "$winner" in
+        one)
+            [[ $(<"${destination}/resources/one") == "alpha" ]] &&
+                [[ ! -e "${destination}/resources/two" ]]
+            ;;
+        two)
+            [[ $(<"${destination}/resources/two/other.txt") == "gamma" ]] &&
+                [[ ! -e "${destination}/resources/one" ]]
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+test_publication_rollback_states() {
+    local source="${TEST_DIRECTORY}/rollback-source"
+    local destination="${TEST_DIRECTORY}/rollback-destination"
+
+    printf 'complete\n' > "$source"
+    (
+        local calls=0
+        _fs_unlink() {
+            calls=$((calls + 1))
+            if (( calls == 1 )); then
+                return 1
+            fi
+            rm -- "$1"
+        }
+        ! fs_move_no_replace "$source" "$destination"
+    ) || return 1
+    [[ -e "$source" && ! -e "$destination" ]] || return 1
+
+    (
+        _fs_unlink() { return 1; }
+        fs_move_no_replace "$source" "$destination"
+        [[ $? -eq 2 ]]
+    ) || return 1
+
+    [[ -e "$source" && -e "$destination" ]] &&
+        [[ "$source" -ef "$destination" ]]
 }
 
 setup
 
 run_test "backs up one file" test_create_file
-run_test "backs up a symbolic link as a resource" test_create_symlink_resource
+run_test "rejects a symlink resource that escapes its logical root" \
+    test_rejects_escaping_symlink_resource
 run_test "backs up directories and resources from different paths" \
     test_create_directory_and_multiple_sources
 run_test "records a missing optional resource" test_optional_missing
@@ -341,10 +520,21 @@ run_test "does not overwrite an existing output" test_existing_output
 run_test "escapes JSON special characters and UTF-8" test_json_special_characters
 run_test "lists, reads, verifies and extracts a valid OAA" \
     test_list_manifest_verify_extract
+run_test "requires an absent extraction destination" \
+    test_extract_requires_absent_destination
 run_test "rejects a corrupt archive" test_corrupt_archive
 run_test "rejects structurally invalid archives" test_invalid_archives
 run_test "rejects a declared but absent resource" test_declared_resource_absent
-run_test "publishes only one concurrent archive" test_concurrent_publication
+run_test "rejects an undeclared physical resource" \
+    test_rejects_undeclared_physical_resource
+run_test "enforces manifest invariants and known types" \
+    test_rejects_invalid_manifest_invariants
+run_test "rejects unsafe symbolic and hard link targets" \
+    test_rejects_unsafe_link_targets
+run_test "rejects source names containing newlines" \
+    test_rejects_source_name_with_newline
+run_test "publishes one complete concurrent archive" test_concurrent_publication
+run_test "defines publication rollback states" test_publication_rollback_states
 run_test "cleans after verification and publication failures" \
     test_verification_and_publication_failure_cleanup
 run_test "cleans temporary files after tar failure" test_tar_failure_cleanup

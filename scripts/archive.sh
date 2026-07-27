@@ -163,6 +163,14 @@ _archive_validate_resources() {
     local index
 
     for index in "${!resource_names[@]}"; do
+        _archive_validate_source_names "${resource_sources[$index]}" || {
+            printf \
+                'archive: resource contains a newline in a path: name=%q path=%q\n' \
+                "${resource_names[$index]}" \
+                "${resource_sources[$index]}" >&2
+            return 1
+        }
+
         if fs_exists "${resource_sources[$index]}"; then
             continue
         fi
@@ -175,6 +183,22 @@ _archive_validate_resources() {
             return 1
         fi
     done
+
+}
+
+_archive_validate_source_names() {
+
+    local source="${1:-}"
+
+    _archive_check_arguments "$source" || return 1
+    [[ "$source" != *$'\n'* && "$source" != *$'\r'* ]] || return 1
+    fs_exists "$source" || return 0
+
+    local path
+
+    while IFS= read -r -d '' path; do
+        [[ "$path" != *$'\n'* && "$path" != *$'\r'* ]] || return 1
+    done < <(find -P "$source" -print0) || return 1
 
 }
 
@@ -493,8 +517,8 @@ archive_extract() {
     _archive_check_arguments "$archive" "$destination" || return 1
     fs_exists "$archive" || return 1
     archive_verify "$archive" || return 1
-
-    fs_mkdir "$destination" || return 1
+    fs_exists "$destination" && return 1
+    fs_mkdir_new "$destination" || return 1
     shift 2
 
     local -a arguments=(
@@ -509,7 +533,15 @@ archive_extract() {
         arguments+=(-- "$@")
     fi
 
-    _archive_tar "${arguments[@]}"
+    _archive_tar "${arguments[@]}" || {
+        fs_remove "$destination" || {
+            printf \
+                'archive: extraction failed and destination cleanup also failed: path=%q\n' \
+                "$destination" >&2
+            return 2
+        }
+        return 1
+    }
 
 }
 
@@ -536,6 +568,18 @@ archive_manifest() {
 
     _archive_check_arguments "$archive" || return 1
     fs_exists "$archive" || return 1
+    archive_verify "$archive" || return 1
+
+    _archive_read_manifest "$archive"
+
+}
+
+_archive_read_manifest() {
+
+    local archive="${1:-}"
+
+    _archive_check_arguments "$archive" || return 1
+    fs_exists "$archive" || return 1
 
     _archive_tar \
         --extract \
@@ -546,130 +590,149 @@ archive_manifest() {
 
 }
 
-_archive_verify_members() {
+_archive_verify_stream() {
 
-    local archive="${1:-}"
-    local member
-    local manifest_count=0
-    local has_resources=false
-
-    while IFS= read -r member; do
-        case "$member" in
-            manifest.json)
-                manifest_count=$((manifest_count + 1))
-                ;;
-            resources|resources/)
-                has_resources=true
-                ;;
-            ""|/*|../*|*/../*|*/..)
-                return 1
-                ;;
-            resources/*)
-                ;;
-            *)
-                return 1
-                ;;
-        esac
-    done < <(
-        _archive_tar \
-            --list \
-            --zstd \
-            --file="$archive"
-    ) || return 1
-
-    (( manifest_count == 1 )) && "$has_resources"
-
-}
-
-_archive_verify_manifest() {
-
-    local archive="${1:-}"
-    archive_manifest "$archive" |
-        python3 -c '
+    python3 -c '
 import json
+import posixpath
 import re
 import sys
+import tarfile
 
-data = json.load(sys.stdin)
+try:
+    archive = tarfile.open(fileobj=sys.stdin.buffer, mode="r|")
+    members = []
+    manifest_contents = []
+    for member in archive:
+        members.append(member)
+        if member.name == "manifest.json" and member.isfile():
+            manifest_file = archive.extractfile(member)
+            if manifest_file is not None:
+                manifest_contents.append(manifest_file.read())
+except (tarfile.TarError, OSError):
+    raise SystemExit(1)
+
+if any("\n" in member.name or "\r" in member.name for member in members):
+    raise SystemExit(1)
+
+manifest_members = [member for member in members if member.name == "manifest.json"]
+if (
+    len(manifest_members) != 1
+    or not manifest_members[0].isfile()
+    or len(manifest_contents) != 1
+):
+    raise SystemExit(1)
+if not any(member.name.rstrip("/") == "resources" and member.isdir() for member in members):
+    raise SystemExit(1)
+
+member_names = set()
+for member in members:
+    name = member.name.rstrip("/") if member.isdir() else member.name
+    if (
+        not name
+        or name.startswith("/")
+        or ".." in name.split("/")
+        or (name != "manifest.json" and name != "resources" and not name.startswith("resources/"))
+        or name in member_names
+    ):
+        raise SystemExit(1)
+    member_names.add(name)
+
+try:
+    data = json.loads(manifest_contents[0])
+except (UnicodeDecodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+
 if not isinstance(data, dict) or data.get("format") != "OAA" or data.get("version") != "1.0":
     raise SystemExit(1)
 resources = data.get("resources")
 if not isinstance(resources, list):
     raise SystemExit(1)
-names = set()
-paths = set()
+
+allowed_types = {"file", "directory", "symlink"}
+declared = {}
 for item in resources:
-    if not isinstance(item, dict):
-        raise SystemExit(1)
-    required = {
+    required_keys = {
         "name", "source", "archive_path", "type", "required",
         "included", "size", "entries",
     }
-    if not required.issubset(item):
+    if not isinstance(item, dict) or not required_keys.issubset(item):
         raise SystemExit(1)
     name = item["name"]
     path = item["archive_path"]
     if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", name):
         raise SystemExit(1)
-    if path != "resources/" + name or path.startswith("/") or ".." in path.split("/"):
+    if not isinstance(item["source"], str) or not isinstance(item["type"], str):
         raise SystemExit(1)
-    if name in names or path in paths:
+    if not isinstance(path, str) or path != "resources/" + name:
+        raise SystemExit(1)
+    if name in declared:
         raise SystemExit(1)
     if not isinstance(item["required"], bool) or not isinstance(item["included"], bool):
         raise SystemExit(1)
-    if not isinstance(item["size"], int) or item["size"] < 0:
+    if type(item["size"]) is not int or item["size"] < 0:
         raise SystemExit(1)
-    if not isinstance(item["entries"], int) or item["entries"] < 0:
+    if type(item["entries"]) is not int or item["entries"] < 0:
         raise SystemExit(1)
-    names.add(name)
-    paths.add(path)
+    if item["included"]:
+        if item["type"] not in allowed_types:
+            raise SystemExit(1)
+    else:
+        if (
+            item["type"] != "missing"
+            or item["size"] != 0
+            or item["entries"] != 0
+            or item["required"]
+        ):
+            raise SystemExit(1)
+    declared[name] = item
+
+present = set()
+physical_roots = {}
+for member in members:
+    if not member.name.startswith("resources/"):
+        continue
+    relative = member.name[len("resources/"):].rstrip("/")
+    if not relative:
+        continue
+    logical_name = relative.split("/", 1)[0]
+    if logical_name not in declared:
+        raise SystemExit(1)
+    present.add(logical_name)
+    if member.name.rstrip("/") == "resources/" + logical_name:
+        physical_roots[logical_name] = member
+
+    if not (member.isfile() or member.isdir() or member.issym() or member.islnk()):
+        raise SystemExit(1)
+
+    if member.issym() or member.islnk():
+        target = member.linkname
+        if not isinstance(target, str) or not target or target.startswith("/"):
+            raise SystemExit(1)
+        resource_root = "resources/" + logical_name
+        if member.issym():
+            resolved = posixpath.normpath(posixpath.join(posixpath.dirname(member.name), target))
+        else:
+            resolved = posixpath.normpath(target)
+        if resolved != resource_root and not resolved.startswith(resource_root + "/"):
+            raise SystemExit(1)
+
+for name, item in declared.items():
+    if item["included"] != (name in present):
+        raise SystemExit(1)
+    if not item["included"]:
+        continue
+    root = physical_roots.get(name)
+    if root is None:
+        raise SystemExit(1)
+    expected_type = item["type"]
+    if (
+        (expected_type == "file" and not root.isfile())
+        or (expected_type == "directory" and not root.isdir())
+        or (expected_type == "symlink" and not root.issym())
+    ):
+        raise SystemExit(1)
 '
-
-}
-
-_archive_verify_resource_map() {
-
-    local archive="${1:-}"
-    local archive_path
-    local included
-    local member
-    local found
-    local -a members=()
-
-    mapfile -t members < <(
-        _archive_tar \
-            --list \
-            --zstd \
-            --file="$archive"
-    ) || return 1
-
-    while IFS=$'\t' read -r archive_path included; do
-        found=false
-
-        for member in "${members[@]}"; do
-            if [[ "$member" == "$archive_path" ||
-                  "$member" == "${archive_path}/"* ]]; then
-                found=true
-                break
-            fi
-        done
-
-        if [[ "$included" == "true" ]]; then
-            "$found" || return 1
-        else
-            "$found" && return 1
-        fi
-    done < <(
-        archive_manifest "$archive" |
-            python3 -c '
-import json
-import sys
-for item in json.load(sys.stdin)["resources"]:
-    print(item["archive_path"], str(item["included"]).lower(), sep="\t")
-'
-    )
-
-    return 0
 
 }
 
@@ -680,14 +743,7 @@ archive_verify() {
     _archive_check_arguments "$archive" || return 1
     fs_exists "$archive" || return 1
 
-    _archive_tar \
-        --list \
-        --zstd \
-        --file="$archive" \
-        >/dev/null 2>&1 || return 1
-
-    _archive_verify_members "$archive" || return 1
-    _archive_verify_manifest "$archive" || return 1
-    _archive_verify_resource_map "$archive" || return 1
+    _archive_zstd --decompress --stdout "$archive" |
+        _archive_verify_stream
 
 }
