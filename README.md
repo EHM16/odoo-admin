@@ -57,26 +57,29 @@ El Builder añade cada recurso directamente desde su ubicación original:
 4. añade los recursos mediante `tar -C`, sin copiarlos previamente;
 5. comprime una sola vez con zstd;
 6. verifica el archivo provisional;
-7. lo publica mediante un movimiento atómico que no sobrescribe archivos;
+7. crea atómicamente el nombre final mediante un enlace duro y elimina el
+   nombre provisional;
 8. elimina los temporales tanto al finalizar como ante un error.
 
 Este diseño evita duplicar `addons`, `filestore` y los demás recursos en
 `/tmp`. La implementación anterior hacía staging mediante `cp`, lo que podía
 agotar un `/tmp` montado como `tmpfs` aunque el disco principal tuviera espacio.
 
-El TAR temporal es la única representación intermedia grande. Se preservan
-permisos, marcas de tiempo, enlaces simbólicos y directorios vacíos.
+El TAR temporal es la única copia intermedia sin comprimir. Durante la
+compresión coexisten el TAR y el OAA provisional, por lo que el filesystem de
+destino debe disponer de espacio para ambos, además de sus metadatos. Se
+preservan permisos, marcas de tiempo, enlaces simbólicos y directorios vacíos.
 
 ## API pública de archivado
 
 La biblioteca `scripts/archive.sh` expone:
 
 - `archive_create`: crea y verifica un OAA antes de publicarlo;
-- `archive_extract`: extrae un OAA en un directorio de destino;
+- `archive_extract`: verifica y extrae un OAA sin reemplazar archivos existentes;
 - `archive_list`: lista los recursos declarados;
 - `archive_manifest`: imprime el manifiesto JSON;
 - `archive_verify`: valida estructura, manifiesto y correspondencia de recursos;
-- `archive_check_environment`: comprueba la disponibilidad de GNU tar y zstd.
+- `archive_check_environment`: comprueba GNU tar, zstd y Python 3.
 
 ### Crear un archivo
 
@@ -137,6 +140,11 @@ identificarse sin depender de su ruta original.
 Los valores se serializan como JSON válido, incluidos nombres y rutas con
 espacios, comillas o caracteres que requieren escape.
 
+La ruta absoluta de origen se conserva deliberadamente como dato de
+trazabilidad. Por ello, el manifiesto puede revelar rutas internas del servidor:
+un OAA debe tratarse como información sensible y protegerse con los mismos
+controles de acceso que los datos respaldados.
+
 ## Respaldo del sistema de archivos de Odoo
 
 `backup/bin/backup-files.sh` crea un OAA con los recursos definidos en
@@ -169,22 +177,24 @@ crea el OAA diario y después aplica las rotaciones semanal y mensual.
 - Bash 5;
 - GNU tar con soporte para zstd;
 - zstd;
+- Python 3;
 - utilidades GNU habituales (`stat`, `find`, `numfmt`, entre otras);
-- Python 3 únicamente para la validación JSON incluida en las pruebas.
 
 Instalación de las dependencias principales en Debian:
 
 ```bash
 sudo apt update
-sudo apt install bash tar zstd
+sudo apt install bash tar zstd python3
 ```
 
 ## Pruebas
 
-La suite cubre archivos y directorios, varios orígenes, espacios en rutas,
-directorios vacíos, enlaces simbólicos, permisos, timestamps, recursos
-opcionales y obligatorios, archivos corruptos, salida ya existente, limpieza
-ante fallos de TAR o zstd y ausencia de staging mediante `fs_copy`.
+La suite cubre archivos y directorios, varios orígenes, espacios y caracteres
+especiales en JSON, UTF-8, directorios vacíos, enlaces simbólicos, permisos,
+timestamps, recursos opcionales y obligatorios, diagnóstico de ausencias,
+publicación concurrente, archivos corruptos, manifiestos inválidos, recursos
+declarados pero ausentes, path traversal, salida ya existente, limpieza ante
+fallos de TAR o zstd y ausencia de staging mediante `fs_copy`.
 
 ```bash
 bash tests/archive_test.sh
@@ -205,11 +215,16 @@ git diff --check
 ## Seguridad e integridad
 
 - Un OAA no se publica hasta superar `archive_verify`.
-- La salida final no sobrescribe un archivo existente.
-- El archivo provisional se crea junto al destino para mantener la publicación
-  en el mismo sistema de archivos.
+- La publicación usa `link(2)` mediante `ln`: la creación del nombre final es
+  atómica y falla si ya existe. El provisional se crea junto al destino para
+  garantizar el mismo filesystem. Entre ejecuciones concurrentes sólo una
+  publica; las demás no modifican el destino.
 - Los fallos intermedios eliminan los archivos temporales.
-- El manifiesto y el contenido se validan antes de aceptar el archivo.
+- La verificación exige un único `manifest.json`, JSON y versión compatibles,
+  raíz `resources/`, nombres lógicos únicos, rutas internas seguras y
+  correspondencia entre recursos declarados e incluidos.
+- `archive_extract` ejecuta esa verificación como precondición y no reemplaza
+  archivos preexistentes en el destino.
 
 Estas garantías reducen el riesgo de conservar respaldos parciales. Aun así, la
 verificación técnica de un archivo no reemplaza una restauración periódica de
