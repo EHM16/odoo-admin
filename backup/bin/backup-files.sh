@@ -28,13 +28,11 @@ source /opt/odoo-admin/scripts/archive.sh
 
 log_init
 
-config_load_all
 # ============================================================
 # Configuración
 # ============================================================
 
-config_load system
-config_load backup
+config_load_all
 config_load files
 
 config_require \
