@@ -316,6 +316,34 @@ fs_move_no_replace() {
 
 }
 
+fs_lock_acquire() {
+
+    local lock_file="${1:-}"
+    local descriptor_variable="${2:-}"
+    local descriptor
+    local lock_status
+
+    _fs_check_arguments "$lock_file" "$descriptor_variable" || return 2
+    [[ "$descriptor_variable" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || return 2
+    command -v flock >/dev/null 2>&1 || return 2
+
+    exec {descriptor}>"$lock_file" || return 2
+
+    flock --nonblock "$descriptor"
+    lock_status=$?
+
+    if (( lock_status != 0 )); then
+        exec {descriptor}>&-
+        (( lock_status == 1 )) && return 1
+        return 2
+    fi
+
+    printf -v "$descriptor_variable" '%s' "$descriptor"
+
+    return 0
+
+}
+
 _fs_unlink() {
 
     local path="${1:-}"

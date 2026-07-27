@@ -178,6 +178,43 @@ El destino, prefijo, formato de fecha y políticas de retención se configuran e
 el mismo archivo. La aplicación valida primero las dependencias y permisos,
 crea el OAA diario y después aplica las rotaciones semanal y mensual.
 
+## Orquestador de respaldo
+
+`backup/bin/backup.sh` es el punto de entrada oficial para ejecutar manualmente
+un trabajo completo:
+
+```bash
+/opt/odoo-admin/backup/bin/backup.sh
+```
+
+El orquestador coordina, en este orden, `backup-db.sh` y `backup-files.sh`. No
+duplica la creación, rotación ni retención de sus respaldos. La salida de ambos
+componentes se hereda directamente para conservar toda la información
+operativa, y el éxito se determina exclusivamente por sus códigos de retorno.
+
+La política no es *fail-fast*: si el respaldo de base de datos falla, el
+respaldo de archivos todavía se ejecuta. Al final se registra un resumen con el
+estado de ambos componentes, la duración total, el resultado global y el
+código:
+
+| Código | Resultado |
+|---:|---|
+| `0` | Ambos componentes terminaron correctamente |
+| `1` | Ambos componentes fallaron |
+| `2` | Sólo uno de los componentes terminó correctamente |
+| `3` | Ejecución rechazada porque otro respaldo está en curso |
+| `4` | Error interno previo a la ejecución de los componentes |
+
+Para impedir trabajos simultáneos, `backup.sh` mantiene durante toda la
+ejecución un bloqueo `flock` no bloqueante sobre
+`/run/lock/odoo-admin-backup.lock`. La ruta puede ajustarse con
+`BACKUP_LOCK_FILE` en `config/backup.conf`. El archivo de lock puede persistir:
+la exclusión depende del descriptor abierto, que el sistema cierra al terminar
+el proceso.
+
+La programación mediante unidades y timers de systemd pertenece a una fase
+posterior y todavía no forma parte del proyecto.
+
 ## Requisitos
 
 - Debian o un sistema compatible;
@@ -185,13 +222,14 @@ crea el OAA diario y después aplica las rotaciones semanal y mensual.
 - GNU tar con soporte para zstd;
 - zstd;
 - Python 3;
+- `flock`, provisto por `util-linux`;
 - utilidades GNU habituales (`stat`, `find`, `numfmt`, entre otras);
 
 Instalación de las dependencias principales en Debian:
 
 ```bash
 sudo apt update
-sudo apt install bash tar zstd python3
+sudo apt install bash tar zstd python3 util-linux
 ```
 
 ## Pruebas
@@ -205,6 +243,7 @@ fallos de TAR o zstd y ausencia de staging mediante `fs_copy`.
 
 ```bash
 bash tests/archive_test.sh
+bash tests/backup_orchestrator_test.sh
 ```
 
 Si zstd no está instalado, la suite usa exclusivamente dentro del entorno de

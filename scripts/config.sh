@@ -10,10 +10,10 @@
 set -uo pipefail
 
 # ============================================================
-# Configuración
+# ConfiguraciÃ³n
 # ============================================================
 
-readonly CONFIG_DIRECTORY="/opt/odoo-admin/config"
+readonly CONFIG_DIRECTORY="${CONFIG_DIRECTORY:-/opt/odoo-admin/config}"
 
 # ============================================================
 # Funciones Privadas
@@ -46,7 +46,7 @@ _config_file() {
 }
 
 # ============================================================
-# API Pública
+# API PÃºblica
 # ============================================================
 
 config_exists() {
