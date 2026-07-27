@@ -167,7 +167,13 @@ _archive_validate_resources() {
             continue
         fi
 
-        [[ "${resource_requirements[$index]}" == "optional" ]] || return 1
+        if [[ "${resource_requirements[$index]}" != "optional" ]]; then
+            printf \
+                'archive: required resource missing: name=%q path=%q requirement=required\n' \
+                "${resource_names[$index]}" \
+                "${resource_sources[$index]}" >&2
+            return 1
+        fi
     done
 
 }
@@ -474,7 +480,8 @@ archive_create() (
 archive_check_environment() {
 
     command -v tar >/dev/null 2>&1 &&
-        command -v zstd >/dev/null 2>&1
+        command -v zstd >/dev/null 2>&1 &&
+        command -v python3 >/dev/null 2>&1
 
 }
 
@@ -485,6 +492,7 @@ archive_extract() {
 
     _archive_check_arguments "$archive" "$destination" || return 1
     fs_exists "$archive" || return 1
+    archive_verify "$archive" || return 1
 
     fs_mkdir "$destination" || return 1
     shift 2
@@ -494,6 +502,7 @@ archive_extract() {
         --zstd
         --directory="$destination"
         --file="$archive"
+        --keep-old-files
     )
 
     if (( $# > 0 )); then
@@ -511,8 +520,13 @@ archive_list() {
     _archive_check_arguments "$archive" || return 1
     fs_exists "$archive" || return 1
 
-    archive_manifest "$archive" \
-        | sed -n 's/^[[:space:]]*"name":[[:space:]]*"\([^"]*\)",[[:space:]]*$/\1/p'
+    archive_manifest "$archive" |
+        python3 -c '
+import json
+import sys
+for resource in json.load(sys.stdin)["resources"]:
+    print(resource["name"])
+'
 
 }
 
@@ -536,18 +550,23 @@ _archive_verify_members() {
 
     local archive="${1:-}"
     local member
-    local has_manifest=false
+    local manifest_count=0
     local has_resources=false
 
     while IFS= read -r member; do
         case "$member" in
             manifest.json)
-                has_manifest=true
+                manifest_count=$((manifest_count + 1))
                 ;;
             resources|resources/)
                 has_resources=true
                 ;;
-            /*|../*|*/../*|*/..)
+            ""|/*|../*|*/../*|*/..)
+                return 1
+                ;;
+            resources/*)
+                ;;
+            *)
                 return 1
                 ;;
         esac
@@ -558,37 +577,65 @@ _archive_verify_members() {
             --file="$archive"
     ) || return 1
 
-    "$has_manifest" && "$has_resources"
+    (( manifest_count == 1 )) && "$has_resources"
 
 }
 
 _archive_verify_manifest() {
 
     local archive="${1:-}"
-    local manifest
+    archive_manifest "$archive" |
+        python3 -c '
+import json
+import re
+import sys
 
-    manifest=$(archive_manifest "$archive") || return 1
-
-    grep -q '"format":[[:space:]]*"OAA"' <<< "$manifest" || return 1
-    grep -q '"version":[[:space:]]*"1.0"' <<< "$manifest" || return 1
-    grep -q '"resources":[[:space:]]*\[' <<< "$manifest" || return 1
+data = json.load(sys.stdin)
+if not isinstance(data, dict) or data.get("format") != "OAA" or data.get("version") != "1.0":
+    raise SystemExit(1)
+resources = data.get("resources")
+if not isinstance(resources, list):
+    raise SystemExit(1)
+names = set()
+paths = set()
+for item in resources:
+    if not isinstance(item, dict):
+        raise SystemExit(1)
+    required = {
+        "name", "source", "archive_path", "type", "required",
+        "included", "size", "entries",
+    }
+    if not required.issubset(item):
+        raise SystemExit(1)
+    name = item["name"]
+    path = item["archive_path"]
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+        raise SystemExit(1)
+    if path != "resources/" + name or path.startswith("/") or ".." in path.split("/"):
+        raise SystemExit(1)
+    if name in names or path in paths:
+        raise SystemExit(1)
+    if not isinstance(item["required"], bool) or not isinstance(item["included"], bool):
+        raise SystemExit(1)
+    if not isinstance(item["size"], int) or item["size"] < 0:
+        raise SystemExit(1)
+    if not isinstance(item["entries"], int) or item["entries"] < 0:
+        raise SystemExit(1)
+    names.add(name)
+    paths.add(path)
+'
 
 }
 
 _archive_verify_resource_map() {
 
     local archive="${1:-}"
-    local manifest
-    local line
-    local archive_path=""
+    local archive_path
     local included
     local member
     local found
-    local path_count=0
-    local included_count=0
     local -a members=()
 
-    manifest=$(archive_manifest "$archive") || return 1
     mapfile -t members < <(
         _archive_tar \
             --list \
@@ -596,38 +643,33 @@ _archive_verify_resource_map() {
             --file="$archive"
     ) || return 1
 
-    while IFS= read -r line; do
-        if [[ "$line" =~ \"archive_path\":[[:space:]]*\"(resources/[A-Za-z0-9._-]+)\" ]]; then
-            archive_path="${BASH_REMATCH[1]}"
-            path_count=$(( path_count + 1 ))
-            continue
-        fi
+    while IFS=$'\t' read -r archive_path included; do
+        found=false
 
-        if [[ -n "$archive_path" &&
-              "$line" =~ \"included\":[[:space:]]*(true|false) ]]; then
-            included="${BASH_REMATCH[1]}"
-            included_count=$(( included_count + 1 ))
-            found=false
-
-            for member in "${members[@]}"; do
-                if [[ "$member" == "$archive_path" ||
-                      "$member" == "${archive_path}/"* ]]; then
-                    found=true
-                    break
-                fi
-            done
-
-            if [[ "$included" == "true" ]]; then
-                "$found" || return 1
-            else
-                "$found" && return 1
+        for member in "${members[@]}"; do
+            if [[ "$member" == "$archive_path" ||
+                  "$member" == "${archive_path}/"* ]]; then
+                found=true
+                break
             fi
+        done
 
-            archive_path=""
+        if [[ "$included" == "true" ]]; then
+            "$found" || return 1
+        else
+            "$found" && return 1
         fi
-    done <<< "$manifest"
+    done < <(
+        archive_manifest "$archive" |
+            python3 -c '
+import json
+import sys
+for item in json.load(sys.stdin)["resources"]:
+    print(item["archive_path"], str(item["included"]).lower(), sep="\t")
+'
+    )
 
-    (( path_count > 0 && path_count == included_count ))
+    return 0
 
 }
 
