@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+
+# ============================================================
+# Odoo Admin
+# Filesystem Library
+# ------------------------------------------------------------
+# Version : 1.0
+# ============================================================
+
+set -uo pipefail
+
+# ============================================================
+# Funciones Privadas
+# ============================================================
+
+_fs_check_arguments() {
+
+    local argument
+
+    for argument in "$@"; do
+
+        [[ -n "$argument" ]] || return 1
+
+    done
+
+    return 0
+
+}
+
+# ============================================================
+# Directorios
+# ============================================================
+
+fs_mkdir() {
+
+    local directory="${1:-}"
+
+    _fs_check_arguments "$directory" || return 1
+
+    mkdir -p "$directory"
+
+}
+
+fs_is_writable() {
+
+    local directory="${1:-}"
+    local test_file
+
+    _fs_check_arguments "$directory" || return 1
+
+    mkdir -p "$directory" || return 1
+
+    test_file="${directory}/.write_test"
+
+    touch "$test_file" 2>/dev/null || return 1
+
+    rm -f "$test_file"
+
+    return 0
+
+}
+
+# ============================================================
+# Información
+# ============================================================
+
+fs_exists() {
+
+    local path="${1:-}"
+
+    _fs_check_arguments "$path" || return 1
+
+    [[ -e "$path" ]]
+
+}
+
+fs_size() {
+
+    local path="${1:-}"
+
+    _fs_check_arguments "$path" || return 1
+
+    if [[ -d "$path" ]]; then
+
+        du -sb "$path" | cut -f1
+
+    else
+
+        stat -c %s "$path"
+
+    fi
+
+}
+
+fs_count() {
+
+    local directory="${1:-}"
+    local pattern="${2:-*}"
+
+    _fs_check_arguments "$directory" || return 1
+
+    find "$directory" \
+        -maxdepth 1 \
+        -type f \
+        -name "$pattern" \
+        | wc -l
+
+}
+
+fs_entries() {
+
+    local path="${1:-}"
+
+    _fs_check_arguments "$path" || return 1
+
+    if [[ -d "$path" ]]; then
+
+        find "$path" \
+            -mindepth 1 \
+            | wc -l
+
+    else
+
+        echo 1
+
+    fi
+
+}
+
+fs_type() {
+
+    local path="${1:-}"
+
+    _fs_check_arguments "$path" || return 1
+
+    if [[ -d "$path" ]]; then
+
+        echo "directory"
+
+    elif [[ -f "$path" ]]; then
+
+        echo "file"
+
+    else
+
+        echo "unknown"
+
+        return 1
+
+    fi
+
+}
+
+# ============================================================
+# Búsqueda
+# ============================================================
+
+fs_list() {
+
+    local directory="${1:-}"
+    local pattern="${2:-*}"
+
+    _fs_check_arguments "$directory" || return 1
+
+    find "$directory" \
+        -maxdepth 1 \
+        -type f \
+        -name "$pattern" \
+        | sort
+
+}
+
+fs_latest() {
+
+    local directory="${1:-}"
+    local pattern="${2:-*}"
+
+    _fs_check_arguments "$directory" || return 1
+
+    fs_list "$directory" "$pattern" | tail -n 1
+
+}
+
+fs_oldest() {
+
+    local directory="${1:-}"
+    local pattern="${2:-*}"
+
+    _fs_check_arguments "$directory" || return 1
+
+    fs_list "$directory" "$pattern" | head -n 1
+
+}
+
+# ============================================================
+# Operaciones
+# ============================================================
+
+fs_copy() {
+
+    local source="${1:-}"
+    local destination="${2:-}"
+
+    _fs_check_arguments \
+        "$source" \
+        "$destination" || return 1
+
+    cp -a \
+        "$source" \
+        "$destination"
+
+}
+
+fs_move() {
+
+    local source="${1:-}"
+    local destination="${2:-}"
+
+    _fs_check_arguments \
+        "$source" \
+        "$destination" || return 1
+
+    mv "$source" "$destination"
+
+}
+
+fs_remove() {
+
+    local path="${1:-}"
+
+    _fs_check_arguments "$path" || return 1
+
+    rm -rf "$path"
+
+}
+
+fs_tempdir() {
+
+    mktemp -d
+
+}
+
+# ============================================================
+# Respaldos
+# ============================================================
+
+fs_backup_filename() {
+
+    local directory="${1:-}"
+    local prefix="${2:-}"
+    local extension="${3:-}"
+    local date_format="${4:-}"
+
+    _fs_check_arguments \
+        "$directory" \
+        "$prefix" \
+        "$extension" \
+        "$date_format" || return 1
+
+    printf "%s/%s_%s.%s\n" \
+        "$directory" \
+        "$prefix" \
+        "$(date "$date_format")" \
+        "$extension"
+
+}
+# ============================================================
+# Retención
+# ============================================================
+
+fs_prune() {
+
+    local directory="${1:-}"
+    local pattern="${2:-}"
+    local retention="${3:-}"
+
+    _fs_check_arguments \
+        "$directory" \
+        "$pattern" \
+        "$retention" || return 1
+
+    local total
+    local delete_count
+    local i
+
+    local -a files
+
+    mapfile -t files < <(
+
+        fs_list \
+            "$directory" \
+            "$pattern"
+
+    )
+
+    total=${#files[@]}
+
+    (( total > retention )) || return 0
+
+    delete_count=$(( total - retention ))
+
+    for (( i=0; i<delete_count; i++ )); do
+
+        fs_remove "${files[$i]}" || return 1
+
+    done
+
+    return 0
+
+}
