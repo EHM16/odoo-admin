@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+
+# Test-only zstd protocol substitute for environments without zstd.
+# It lets GNU tar and archive.sh exercise their compression pipelines.
+
+set -uo pipefail
+
+decompress=false
+stdout=false
+declare -a files=()
+
+while (( $# > 0 )); do
+    case "$1" in
+        -d|--decompress)
+            decompress=true
+            ;;
+        -c|--stdout)
+            stdout=true
+            ;;
+        -q|--quiet|-f|--force)
+            ;;
+        --)
+            shift
+            files+=("$@")
+            break
+            ;;
+        -*)
+            ;;
+        *)
+            files+=("$1")
+            ;;
+    esac
+
+    shift
+done
+
+if "$decompress"; then
+    if (( ${#files[@]} > 0 )); then
+        gzip --decompress --stdout -- "${files[0]}"
+    else
+        gzip --decompress --stdout
+    fi
+elif (( ${#files[@]} > 0 )); then
+    gzip --stdout -- "${files[0]}"
+else
+    gzip --stdout
+fi

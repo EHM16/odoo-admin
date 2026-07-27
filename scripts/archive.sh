@@ -2,15 +2,18 @@
 
 # ============================================================
 # Odoo Admin
-# Archive Library
+# OAA Archive Library
 # ------------------------------------------------------------
-# Version : 1.0
+# Version : 2.0
 # ============================================================
 
 set -uo pipefail
 
+# archive_create retains legacy NAME SOURCE pairs (required by default).
+# The explicit --descriptors mode accepts NAME SOURCE required|optional.
+
 # ============================================================
-# Funciones Privadas
+# Generic Helpers
 # ============================================================
 
 _archive_check_arguments() {
@@ -18,458 +21,729 @@ _archive_check_arguments() {
     local argument
 
     for argument in "$@"; do
-
         [[ -n "$argument" ]] || return 1
-
     done
-
-    return 0
 
 }
 
 _archive_tar() {
 
     command -v tar >/dev/null 2>&1 || return 1
-
     tar "$@"
+
+}
+
+_archive_zstd() {
+
+    command -v zstd >/dev/null 2>&1 || return 1
+    zstd "$@"
+
+}
+
+_archive_json_escape() {
+
+    local value="${1-}"
+    local result=""
+    local character
+    local code
+    local i
+
+    local LC_ALL=C
+
+    for (( i=0; i<${#value}; i++ )); do
+        character="${value:i:1}"
+
+        case "$character" in
+            '"')    result+='\"' ;;
+            \\)    result+='\\' ;;
+            $'\b') result+='\b' ;;
+            $'\f') result+='\f' ;;
+            $'\n') result+='\n' ;;
+            $'\r') result+='\r' ;;
+            $'\t') result+='\t' ;;
+            *)
+                printf -v code '%d' "'$character"
+
+                if (( code < 32 )); then
+                    printf -v character '\\u%04x' "$code"
+                fi
+
+                result+="$character"
+                ;;
+        esac
+    done
+
+    printf '%s' "$result"
+
+}
+
+_archive_json_string() {
+
+    printf '"%s"' "$(_archive_json_escape "${1-}")"
+
+}
+
+_archive_is_requirement() {
+
+    [[ "${1:-}" == "required" || "${1:-}" == "optional" ]]
+
+}
+
+# ============================================================
+# Resource Descriptors
+# ============================================================
+
+_archive_parse_resources() {
+
+    local names_ref="${1:-}"
+    local sources_ref="${2:-}"
+    local requirements_ref="${3:-}"
+    local descriptor_width="${4:-}"
+
+    shift 4
+
+    _archive_check_arguments \
+        "$names_ref" \
+        "$sources_ref" \
+        "$requirements_ref" \
+        "$descriptor_width" || return 1
+
+    (( $# >= 2 )) || return 1
+    [[ "$descriptor_width" == "2" || "$descriptor_width" == "3" ]] || return 1
+    (( $# % descriptor_width == 0 )) || return 1
+
+    local -n output_names="$names_ref"
+    local -n output_sources="$sources_ref"
+    local -n output_requirements="$requirements_ref"
+    local name
+    local source
+    local requirement
+    local existing
+
+    while (( $# > 0 )); do
+        name="$1"
+        source="$2"
+        requirement="required"
+
+        if (( descriptor_width == 3 )); then
+            requirement="$3"
+        fi
+
+        _archive_check_arguments "$name" "$source" "$requirement" || return 1
+        [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+        _archive_is_requirement "$requirement" || return 1
+
+        for existing in "${output_names[@]}"; do
+            [[ "$existing" != "$name" ]] || return 1
+        done
+
+        output_names+=("$name")
+        output_sources+=("$source")
+        output_requirements+=("$requirement")
+
+        shift "$descriptor_width"
+    done
 
 }
 
 _archive_validate_resources() {
 
-    local name
-    local path
+    local names_ref="${1:-}"
+    local sources_ref="${2:-}"
+    local requirements_ref="${3:-}"
 
-    (( $# >= 2 )) || return 1
-    (( $# % 2 == 0 )) || return 1
+    _archive_check_arguments \
+        "$names_ref" \
+        "$sources_ref" \
+        "$requirements_ref" || return 1
 
-    while (( $# > 0 )); do
+    local -n resource_names="$names_ref"
+    local -n resource_sources="$sources_ref"
+    local -n resource_requirements="$requirements_ref"
+    local index
 
-        name="$1"
-        path="$2"
+    for index in "${!resource_names[@]}"; do
+        _archive_validate_source_names "${resource_sources[$index]}" || {
+            printf \
+                'archive: resource contains a newline in a path: name=%q path=%q\n' \
+                "${resource_names[$index]}" \
+                "${resource_sources[$index]}" >&2
+            return 1
+        }
 
-        _archive_check_arguments \
-            "$name" \
-            "$path" || return 1
+        if fs_exists "${resource_sources[$index]}"; then
+            continue
+        fi
 
-        [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
-
-        fs_exists "$path" || return 1
-
-        shift 2
-
+        if [[ "${resource_requirements[$index]}" != "optional" ]]; then
+            printf \
+                'archive: required resource missing: name=%q path=%q requirement=required\n' \
+                "${resource_names[$index]}" \
+                "${resource_sources[$index]}" >&2
+            return 1
+        fi
     done
 
-    return 0
+}
+
+_archive_validate_source_names() {
+
+    local source="${1:-}"
+
+    _archive_check_arguments "$source" || return 1
+    [[ "$source" != *$'\n'* && "$source" != *$'\r'* ]] || return 1
+    fs_exists "$source" || return 0
+
+    local path
+
+    while IFS= read -r -d '' path; do
+        [[ "$path" != *$'\n'* && "$path" != *$'\r'* ]] || return 1
+    done < <(find -P "$source" -print0) || return 1
 
 }
 
 _archive_resource_info() {
 
     local path="${1:-}"
-
-    local __type="${2:-}"
-    local __size="${3:-}"
-    local __entries="${4:-}"
+    local type_ref="${2:-}"
+    local size_ref="${3:-}"
+    local entries_ref="${4:-}"
 
     _archive_check_arguments \
         "$path" \
-        "$__type" \
-        "$__size" \
-        "$__entries" || return 1
+        "$type_ref" \
+        "$size_ref" \
+        "$entries_ref" || return 1
 
-   local value
+    local value
 
-   value=$(fs_type "$path") || return 1
-   printf -v "$__type" "%s" "$value"
+    value=$(fs_type "$path") || return 1
+    printf -v "$type_ref" '%s' "$value"
 
-   value=$(fs_size "$path") || return 1
-   printf -v "$__size" "%s" "$value"
+    value=$(fs_size "$path") || return 1
+    printf -v "$size_ref" '%s' "$value"
 
-   value=$(fs_entries "$path") || return 1
-   printf -v "$__entries" "%s" "$value"
-   
-   return 0
+    value=$(fs_entries "$path") || return 1
+    printf -v "$entries_ref" '%s' "$value"
 
 }
 
 # ============================================================
-# Crear Manifest OAA
+# OAA Builder
 # ============================================================
 
-_archive_create_manifest() {
+_builder_begin() {
 
-    local manifest="${1:-}"
+    local output="${1:-}"
+    local control_ref="${2:-}"
+    local tar_ref="${3:-}"
+    local compressed_ref="${4:-}"
 
-    shift
+    _archive_check_arguments \
+        "$output" \
+        "$control_ref" \
+        "$tar_ref" \
+        "$compressed_ref" || return 1
 
-    _archive_check_arguments "$manifest" || return 1
+    local output_directory
+    local output_name
+    local value
 
+    output_directory=$(dirname -- "$output") || return 1
+    output_name=$(basename -- "$output") || return 1
+
+    fs_mkdir "$output_directory" || return 1
+    fs_exists "$output" && return 1
+
+    value=$(fs_tempdir_in "$output_directory" ".${output_name}.control.XXXXXX") \
+        || return 1
+    printf -v "$control_ref" '%s' "$value"
+
+    fs_mkdir "${value}/resources" || return 1
+
+    value=$(fs_tempfile_in "$output_directory" ".${output_name}.tar.XXXXXX") \
+        || return 1
+    printf -v "$tar_ref" '%s' "$value"
+
+    value=$(fs_tempfile_in "$output_directory" ".${output_name}.oaa.XXXXXX") \
+        || return 1
+    printf -v "$compressed_ref" '%s' "$value"
+
+}
+
+_builder_add_manifest() {
+
+    local control_directory="${1:-}"
+    local names_ref="${2:-}"
+    local sources_ref="${3:-}"
+    local requirements_ref="${4:-}"
+    local tar_file="${5:-}"
+
+    _archive_check_arguments \
+        "$control_directory" \
+        "$names_ref" \
+        "$sources_ref" \
+        "$requirements_ref" \
+        "$tar_file" || return 1
+
+    local -n manifest_names="$names_ref"
+    local -n manifest_sources="$sources_ref"
+    local -n manifest_requirements="$requirements_ref"
+    local manifest="${control_directory}/manifest.json"
     local first=true
+    local index
+    local included
+    local type
+    local size
+    local entries
 
     {
+        printf '{\n'
+        printf '  "format": "OAA",\n'
+        printf '  "version": "1.0",\n'
+        printf '  "framework": %s,\n' \
+            "$(_archive_json_string "${PRODUCT_NAME:-Odoo Admin}")"
+        printf '  "framework_version": %s,\n' \
+            "$(_archive_json_string "${PRODUCT_VERSION:-unknown}")"
+        printf '  "created": %s,\n' \
+            "$(_archive_json_string "$(date --iso-8601=seconds)")"
+        printf '  "hostname": %s,\n' \
+            "$(_archive_json_string "$(hostname)")"
+        printf '  "resources": [\n'
 
-        echo "{"
-        echo "    \"format\": \"OAA\","
-        echo "    \"version\": \"1.0\","
-        echo "    \"framework\": \"${PRODUCT_NAME}\","
-        echo "    \"framework_version\": \"${PRODUCT_VERSION}\","
-        echo "    \"created\": \"$(date --iso-8601=seconds)\","
-        echo "    \"hostname\": \"$(hostname)\","
-        echo "    \"resources\": ["
+        for index in "${!manifest_names[@]}"; do
+            included=false
+            type="missing"
+            size=0
+            entries=0
 
-        while (( $# > 0 )); do
-
-            local name="$1"
-            shift
-
-            local path="$1"
-            shift
-
-            local type
-            local size
-            local entries
-
-            _archive_resource_info \
-                "$path" \
-                type \
-                size \
-                entries || return 1
-
-            if $first; then
-
-                first=false
-
-            else
-
-                echo ","
-
+            if fs_exists "${manifest_sources[$index]}"; then
+                included=true
+                _archive_resource_info \
+                    "${manifest_sources[$index]}" \
+                    type \
+                    size \
+                    entries || return 1
             fi
 
-            cat <<EOF
-        {
-            "name": "$name",
-            "type": "$type",
-            "required": true,
-            "size": $size,
-            "entries": $entries
-        }
-EOF
+            if "$first"; then
+                first=false
+            else
+                printf ',\n'
+            fi
 
+            printf '    {\n'
+            printf '      "name": %s,\n' \
+                "$(_archive_json_string "${manifest_names[$index]}")"
+            printf '      "source": %s,\n' \
+                "$(_archive_json_string "${manifest_sources[$index]}")"
+            printf '      "archive_path": %s,\n' \
+                "$(_archive_json_string "resources/${manifest_names[$index]}")"
+            printf '      "type": %s,\n' \
+                "$(_archive_json_string "$type")"
+            printf '      "required": %s,\n' \
+                "$([[ "${manifest_requirements[$index]}" == "required" ]] \
+                    && printf true || printf false)"
+            printf '      "included": %s,\n' "$included"
+            printf '      "size": %s,\n' "$size"
+            printf '      "entries": %s\n' "$entries"
+            printf '    }'
         done
 
-        echo
-        echo "    ]"
-        echo "}"
+        printf '\n  ]\n'
+        printf '}\n'
+    } > "$manifest" || return 1
 
-    } > "$manifest"
+    _archive_tar \
+        --create \
+        --file="$tar_file" \
+        --directory="$control_directory" \
+        manifest.json \
+        resources || return 1
 
 }
 
-# ============================================================
-# Preparar Recursos
-# ============================================================
+_builder_add_resource() {
 
-_archive_stage_resources() {
+    local tar_file="${1:-}"
+    local name="${2:-}"
+    local source="${3:-}"
+    local requirement="${4:-}"
 
-    local workspace="${1:-}"
+    _archive_check_arguments \
+        "$tar_file" \
+        "$name" \
+        "$source" \
+        "$requirement" || return 1
 
-    shift
+    if ! fs_exists "$source"; then
+        [[ "$requirement" == "optional" ]]
+        return
+    fi
 
-    _archive_check_arguments "$workspace" || return 1
+    local source_parent
+    local source_name
+    local transform
 
-    while (( $# > 0 )); do
+    if [[ "$source" == "/" ]]; then
+        source_parent="/"
+        source_name="."
+    else
+        source="${source%/}"
+        source_parent=$(dirname -- "$source") || return 1
+        source_name=$(basename -- "$source") || return 1
+    fi
 
-        local name="$1"
-        shift
+    # Rename member paths and hard-link targets, but preserve symbolic-link
+    # targets exactly as they exist at the source.
+    transform="flags=rh;s|^[^/]*|resources/${name}|"
 
-        local path="$1"
-        shift
+    _archive_tar \
+        --append \
+        --file="$tar_file" \
+        --directory="$source_parent" \
+        --transform="$transform" \
+        "$source_name" || return 1
 
-        fs_copy \
-            "$path" \
-            "${workspace}/${name}" \
-            || return 1
+}
 
+_builder_finish() {
+
+    local tar_file="${1:-}"
+    local compressed_file="${2:-}"
+
+    _archive_check_arguments "$tar_file" "$compressed_file" || return 1
+
+    _archive_zstd \
+        --quiet \
+        --stdout \
+        "$tar_file" \
+        > "$compressed_file" || return 1
+
+}
+
+_builder_cleanup() {
+
+    local path
+    local status=0
+
+    for path in "$@"; do
+        [[ -n "$path" ]] || continue
+        fs_exists "$path" || continue
+        fs_remove "$path" || status=1
     done
 
-    return 0
+    return "$status"
 
 }
 
 # ============================================================
-# Construir Workspace OAA
+# Public OAA API
 # ============================================================
 
-_archive_build_workspace() {
-
-    local workspace="${1:-}"
-
-    shift
-
-    _archive_check_arguments "$workspace" || return 1
-
-    #
-    # Manifest
-    #
-
-    _archive_create_manifest \
-        "${workspace}/manifest.json" \
-        "$@" || return 1
-
-    #
-    # Recursos
-    #
-
-    _archive_stage_resources \
-        "$workspace" \
-        "$@" || return 1
-
-    return 0
-
-}
-
-# ============================================================
-# Limpiar Workspace
-# ============================================================
-
-_archive_cleanup_workspace() {
-
-    local workspace="${1:-}"
-
-    _archive_check_arguments "$workspace" || return 1
-
-    fs_remove "$workspace"
-
-}
-
-# ============================================================
-# Crear Archivo OAA
-# ============================================================
-
-archive_create() {
+archive_create() (
 
     local archive="${1:-}"
 
     _archive_check_arguments "$archive" || return 1
-
     shift
 
-    #
-    # Debe existir al menos un recurso
-    #
+    local -a names=()
+    local -a sources=()
+    local -a requirements=()
+    local descriptor_width=2
 
-    (( $# >= 2 )) || return 1
+    if [[ "${1:-}" == "--descriptors" ]]; then
+        descriptor_width=3
+        shift
+    fi
 
-    #
-    # Los recursos siempre son pares:
-    #
-    # nombre ruta
-    #
-
-    (( $# % 2 == 0 )) || return 1
-
-    #
-    # Verificar recursos
-    #
-
-    _archive_validate_resources "$@" || return 1
-
-    #
-    # Directorio temporal
-    #
-
-    local workspace
-
-    workspace=$(fs_tempdir) || return 1
-
-    trap '_archive_cleanup_workspace "$workspace"' EXIT
-
-    #
-    # Construcción del Workspace
-    #
-
-    _archive_build_workspace \
-        "$workspace" \
+    _archive_parse_resources \
+        names \
+        sources \
+        requirements \
+        "$descriptor_width" \
         "$@" || return 1
+    _archive_validate_resources names sources requirements || return 1
 
-#
-# Empaquetado
-#
+    local control_directory=""
+    local tar_file=""
+    local compressed_file=""
 
-    _archive_tar \
-        --create \
-        --zstd \
-        --directory="$workspace" \
-        --file="$archive" \
-        . || return 1
+    trap '_builder_cleanup "$control_directory" "$tar_file" "$compressed_file"' EXIT
 
-    #
-    # Limpieza
-    #
+    _builder_begin \
+        "$archive" \
+        control_directory \
+        tar_file \
+        compressed_file || return 1
 
-    trap - EXIT
+    _builder_add_manifest \
+        "$control_directory" \
+        names \
+        sources \
+        requirements \
+        "$tar_file" || return 1
 
-    _archive_cleanup_workspace "$workspace" || return 1
+    local index
 
-    #
-    # Validación
-    #
+    for index in "${!names[@]}"; do
+        _builder_add_resource \
+            "$tar_file" \
+            "${names[$index]}" \
+            "${sources[$index]}" \
+            "${requirements[$index]}" || return 1
+    done
 
-    fs_exists "$archive" || return 1
+    _builder_finish "$tar_file" "$compressed_file" || return 1
+    archive_verify "$compressed_file" || return 1
+    fs_move_no_replace "$compressed_file" "$archive" || return 1
 
-    archive_verify "$archive" || return 1
+)
 
-    return 0
+archive_check_environment() {
+
+    command -v tar >/dev/null 2>&1 &&
+        command -v zstd >/dev/null 2>&1 &&
+        command -v python3 >/dev/null 2>&1
 
 }
-
-# ============================================================
-# Extraer Archivo OAA
-# ============================================================
 
 archive_extract() {
 
     local archive="${1:-}"
     local destination="${2:-}"
 
-    _archive_check_arguments \
-        "$archive" \
-        "$destination" || return 1
-
+    _archive_check_arguments "$archive" "$destination" || return 1
     fs_exists "$archive" || return 1
-
-    fs_mkdir "$destination" || return 1
-
+    archive_verify "$archive" || return 1
+    fs_exists "$destination" && return 1
+    fs_mkdir_new "$destination" || return 1
     shift 2
 
-    #
-    # Restauración completa
-    #
+    local -a arguments=(
+        --extract
+        --zstd
+        --directory="$destination"
+        --file="$archive"
+        --keep-old-files
+    )
 
-    if (( $# == 0 )); then
-
-       _archive_tar \
-           --extract \
-           --zstd \
-           --directory="$destination" \
-           --file="$archive" \
-           || return 1
-
-    return 0
-
+    if (( $# > 0 )); then
+        arguments+=(-- "$@")
     fi
 
-    #
-    # Restauración parcial
-    #
-
-    _archive_tar \
-    --extract \
-    --zstd \
-    --directory="$destination" \
-    --file="$archive" \
-    "$@" || return 1
-
-   return 0
+    _archive_tar "${arguments[@]}" || {
+        fs_remove "$destination" || {
+            printf \
+                'archive: extraction failed and destination cleanup also failed: path=%q\n' \
+                "$destination" >&2
+            return 2
+        }
+        return 1
+    }
 
 }
-
-# ============================================================
-# Listar Recursos
-# ============================================================
 
 archive_list() {
 
     local archive="${1:-}"
 
     _archive_check_arguments "$archive" || return 1
-
     fs_exists "$archive" || return 1
 
-    local manifest
-
-manifest=$(
-    _archive_tar \
-        --extract \
-        --zstd \
-        --to-stdout \
-        --file="$archive" \
-        manifest.json
-) || return 1
-
-grep '"name"' <<< "$manifest" \
-    | cut -d'"' -f4 \
-    || return 1
-
-return 0
+    archive_manifest "$archive" |
+        python3 -c '
+import json
+import sys
+for resource in json.load(sys.stdin)["resources"]:
+    print(resource["name"])
+'
 
 }
-
-# ============================================================
-# Obtener Manifest
-# ============================================================
 
 archive_manifest() {
 
     local archive="${1:-}"
 
     _archive_check_arguments "$archive" || return 1
-
     fs_exists "$archive" || return 1
+    archive_verify "$archive" || return 1
 
-    _archive_tar \
-       --extract \
-       --zstd \
-       --to-stdout \
-       --file="$archive" \
-       manifest.json \
-       || return 1
-
-return 0
+    _archive_read_manifest "$archive"
 
 }
 
-# ============================================================
-# Verificar Archivo OAA
-# ============================================================
-
-archive_verify() {
+_archive_read_manifest() {
 
     local archive="${1:-}"
 
     _archive_check_arguments "$archive" || return 1
-
     fs_exists "$archive" || return 1
 
-  #
-  # Integridad del archivo
-  #
-
-_archive_tar \
-    --list \
-    --file="$archive" \
-    >/dev/null 2>&1 || return 1
-
-  #
-  # Manifest
-  #
-
-local manifest
-
-manifest=$(
     _archive_tar \
         --extract \
         --zstd \
         --to-stdout \
         --file="$archive" \
         manifest.json
-) || return 1
 
-grep -q '"format"[[:space:]]*:' <<< "$manifest" || return 1
-grep -q '"version"[[:space:]]*:' <<< "$manifest" || return 1
-grep -q '"resources"[[:space:]]*:' <<< "$manifest" || return 1
+}
 
-return 0
+_archive_verify_stream() {
+
+    python3 -c '
+import json
+import posixpath
+import re
+import sys
+import tarfile
+
+try:
+    archive = tarfile.open(fileobj=sys.stdin.buffer, mode="r|")
+    members = []
+    manifest_contents = []
+    for member in archive:
+        members.append(member)
+        if member.name == "manifest.json" and member.isfile():
+            manifest_file = archive.extractfile(member)
+            if manifest_file is not None:
+                manifest_contents.append(manifest_file.read())
+except (tarfile.TarError, OSError):
+    raise SystemExit(1)
+
+if any("\n" in member.name or "\r" in member.name for member in members):
+    raise SystemExit(1)
+
+manifest_members = [member for member in members if member.name == "manifest.json"]
+if (
+    len(manifest_members) != 1
+    or not manifest_members[0].isfile()
+    or len(manifest_contents) != 1
+):
+    raise SystemExit(1)
+if not any(member.name.rstrip("/") == "resources" and member.isdir() for member in members):
+    raise SystemExit(1)
+
+member_names = set()
+for member in members:
+    name = member.name.rstrip("/") if member.isdir() else member.name
+    if (
+        not name
+        or name.startswith("/")
+        or ".." in name.split("/")
+        or (name != "manifest.json" and name != "resources" and not name.startswith("resources/"))
+        or name in member_names
+    ):
+        raise SystemExit(1)
+    member_names.add(name)
+
+try:
+    data = json.loads(manifest_contents[0])
+except (UnicodeDecodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+if not isinstance(data, dict) or data.get("format") != "OAA" or data.get("version") != "1.0":
+    raise SystemExit(1)
+resources = data.get("resources")
+if not isinstance(resources, list):
+    raise SystemExit(1)
+
+allowed_types = {"file", "directory", "symlink"}
+declared = {}
+for item in resources:
+    required_keys = {
+        "name", "source", "archive_path", "type", "required",
+        "included", "size", "entries",
+    }
+    if not isinstance(item, dict) or not required_keys.issubset(item):
+        raise SystemExit(1)
+    name = item["name"]
+    path = item["archive_path"]
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+        raise SystemExit(1)
+    if not isinstance(item["source"], str) or not isinstance(item["type"], str):
+        raise SystemExit(1)
+    if not isinstance(path, str) or path != "resources/" + name:
+        raise SystemExit(1)
+    if name in declared:
+        raise SystemExit(1)
+    if not isinstance(item["required"], bool) or not isinstance(item["included"], bool):
+        raise SystemExit(1)
+    if type(item["size"]) is not int or item["size"] < 0:
+        raise SystemExit(1)
+    if type(item["entries"]) is not int or item["entries"] < 0:
+        raise SystemExit(1)
+    if item["included"]:
+        if item["type"] not in allowed_types:
+            raise SystemExit(1)
+    else:
+        if (
+            item["type"] != "missing"
+            or item["size"] != 0
+            or item["entries"] != 0
+            or item["required"]
+        ):
+            raise SystemExit(1)
+    declared[name] = item
+
+present = set()
+physical_roots = {}
+for member in members:
+    if not member.name.startswith("resources/"):
+        continue
+    relative = member.name[len("resources/"):].rstrip("/")
+    if not relative:
+        continue
+    logical_name = relative.split("/", 1)[0]
+    if logical_name not in declared:
+        raise SystemExit(1)
+    present.add(logical_name)
+    if member.name.rstrip("/") == "resources/" + logical_name:
+        physical_roots[logical_name] = member
+
+    if not (member.isfile() or member.isdir() or member.issym() or member.islnk()):
+        raise SystemExit(1)
+
+    if member.issym() or member.islnk():
+        target = member.linkname
+        if not isinstance(target, str) or not target or target.startswith("/"):
+            raise SystemExit(1)
+        resource_root = "resources/" + logical_name
+        if member.issym():
+            resolved = posixpath.normpath(posixpath.join(posixpath.dirname(member.name), target))
+        else:
+            resolved = posixpath.normpath(target)
+        if resolved != resource_root and not resolved.startswith(resource_root + "/"):
+            raise SystemExit(1)
+
+for name, item in declared.items():
+    if item["included"] != (name in present):
+        raise SystemExit(1)
+    if not item["included"]:
+        continue
+    root = physical_roots.get(name)
+    if root is None:
+        raise SystemExit(1)
+    expected_type = item["type"]
+    if (
+        (expected_type == "file" and not root.isfile())
+        or (expected_type == "directory" and not root.isdir())
+        or (expected_type == "symlink" and not root.issym())
+    ):
+        raise SystemExit(1)
+'
+
+}
+
+archive_verify() {
+
+    local archive="${1:-}"
+
+    _archive_check_arguments "$archive" || return 1
+    fs_exists "$archive" || return 1
+
+    _archive_zstd --decompress --stdout "$archive" |
+        _archive_verify_stream
 
 }

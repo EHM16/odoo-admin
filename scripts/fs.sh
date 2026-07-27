@@ -41,6 +41,16 @@ fs_mkdir() {
 
 }
 
+fs_mkdir_new() {
+
+    local directory="${1:-}"
+
+    _fs_check_arguments "$directory" || return 1
+
+    mkdir -- "$directory"
+
+}
+
 fs_is_writable() {
 
     local directory="${1:-}"
@@ -61,7 +71,7 @@ fs_is_writable() {
 }
 
 # ============================================================
-# Información
+# InformaciÃ³n
 # ============================================================
 
 fs_exists() {
@@ -70,7 +80,7 @@ fs_exists() {
 
     _fs_check_arguments "$path" || return 1
 
-    [[ -e "$path" ]]
+    [[ -e "$path" || -L "$path" ]]
 
 }
 
@@ -80,7 +90,11 @@ fs_size() {
 
     _fs_check_arguments "$path" || return 1
 
-    if [[ -d "$path" ]]; then
+    if [[ -L "$path" ]]; then
+
+        stat -c %s "$path"
+
+    elif [[ -d "$path" ]]; then
 
         du -sb "$path" | cut -f1
 
@@ -113,7 +127,11 @@ fs_entries() {
 
     _fs_check_arguments "$path" || return 1
 
-    if [[ -d "$path" ]]; then
+    if [[ -L "$path" ]]; then
+
+        echo 1
+
+    elif [[ -d "$path" ]]; then
 
         find "$path" \
             -mindepth 1 \
@@ -133,7 +151,11 @@ fs_type() {
 
     _fs_check_arguments "$path" || return 1
 
-    if [[ -d "$path" ]]; then
+    if [[ -L "$path" ]]; then
+
+        echo "symlink"
+
+    elif [[ -d "$path" ]]; then
 
         echo "directory"
 
@@ -152,7 +174,7 @@ fs_type() {
 }
 
 # ============================================================
-# Búsqueda
+# BÃºsqueda
 # ============================================================
 
 fs_list() {
@@ -240,6 +262,69 @@ fs_tempdir() {
 
 }
 
+fs_tempdir_in() {
+
+    local directory="${1:-}"
+    local template="${2:-}"
+
+    _fs_check_arguments "$directory" "$template" || return 1
+
+    mktemp \
+        --directory \
+        --tmpdir="$directory" \
+        "$template"
+
+}
+
+fs_tempfile_in() {
+
+    local directory="${1:-}"
+    local template="${2:-}"
+
+    _fs_check_arguments "$directory" "$template" || return 1
+
+    mktemp \
+        --tmpdir="$directory" \
+        "$template"
+
+}
+
+fs_move_no_replace() {
+
+    local source="${1:-}"
+    local destination="${2:-}"
+
+    _fs_check_arguments "$source" "$destination" || return 1
+    # link(2) creates the destination atomically and fails with EEXIST when a
+    # concurrent publisher wins. The caller creates source beside destination,
+    # so both paths are guaranteed to be on the same filesystem.
+    ln -- "$source" "$destination" || return 1
+    _fs_unlink "$source" || {
+        if _fs_unlink "$destination"; then
+            printf \
+                'fs: publication cleanup failed; destination rolled back: source=%q destination=%q\n' \
+                "$source" "$destination" >&2
+            return 1
+        fi
+        printf \
+            'fs: publication cleanup and rollback failed; both names reference the same complete file: source=%q destination=%q\n' \
+            "$source" "$destination" >&2
+        return 2
+    }
+
+    fs_exists "$destination"
+
+}
+
+_fs_unlink() {
+
+    local path="${1:-}"
+
+    _fs_check_arguments "$path" || return 1
+    rm -- "$path"
+
+}
+
 # ============================================================
 # Respaldos
 # ============================================================
@@ -265,7 +350,7 @@ fs_backup_filename() {
 
 }
 # ============================================================
-# Retención
+# RetenciÃ³n
 # ============================================================
 
 fs_prune() {
