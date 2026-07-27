@@ -168,19 +168,13 @@ test_corrupt_archive() {
 
 test_tar_failure_cleanup() {
     local output="${TEST_DIRECTORY}/tar-failure.oaa"
-    local original
 
-    original=$(declare -f _archive_tar)
-    _archive_tar() { return 1; }
-
-    ! archive_create \
-        "$output" \
-        single "${TEST_DIRECTORY}/single file.txt" || {
-        eval "$original"
-        return 1
-    }
-
-    eval "$original"
+    (
+        _archive_tar() { return 1; }
+        ! archive_create \
+            "$output" \
+            single "${TEST_DIRECTORY}/single file.txt"
+    ) || return 1
 
     [[ ! -e "$output" ]] &&
         ! compgen -G "${TEST_DIRECTORY}/.tar-failure.oaa.*" >/dev/null
@@ -188,19 +182,13 @@ test_tar_failure_cleanup() {
 
 test_zstd_failure_cleanup() {
     local output="${TEST_DIRECTORY}/zstd-failure.oaa"
-    local original
 
-    original=$(declare -f _archive_zstd)
-    _archive_zstd() { return 1; }
-
-    ! archive_create \
-        "$output" \
-        single "${TEST_DIRECTORY}/single file.txt" || {
-        eval "$original"
-        return 1
-    }
-
-    eval "$original"
+    (
+        _archive_zstd() { return 1; }
+        ! archive_create \
+            "$output" \
+            single "${TEST_DIRECTORY}/single file.txt"
+    ) || return 1
 
     [[ ! -e "$output" ]] &&
         ! compgen -G "${TEST_DIRECTORY}/.zstd-failure.oaa.*" >/dev/null
@@ -208,20 +196,136 @@ test_zstd_failure_cleanup() {
 
 test_no_staged_resource_copy() {
     local output="${TEST_DIRECTORY}/no-copy.oaa"
-    local original
 
-    original=$(declare -f fs_copy)
-    fs_copy() { return 99; }
+    (
+        fs_copy() { return 99; }
+        archive_create \
+            "$output" \
+            single "${TEST_DIRECTORY}/single file.txt"
+    ) || return 1
 
-    archive_create \
-        "$output" \
-        single "${TEST_DIRECTORY}/single file.txt" || {
-        eval "$original"
-        return 1
-    }
-
-    eval "$original"
     archive_verify "$output"
+}
+
+test_required_missing_diagnostic() {
+    local error
+
+    error=$(
+        archive_create \
+            "${TEST_DIRECTORY}/diagnostic.oaa" \
+            --descriptors \
+            critical "${TEST_DIRECTORY}/missing critical" required 2>&1
+    ) && return 1
+
+    [[ "$error" == *"name=critical"* &&
+       "$error" == *"missing\\ critical"* &&
+       "$error" == *"requirement=required"* ]]
+}
+
+test_json_special_characters() {
+    local archive="${TEST_DIRECTORY}/json.oaa"
+    local source="${TEST_DIRECTORY}/quote\" slash\\ tab"$'\t'" line"$'\n'"return"$'\r'" utf8-á"
+
+    printf 'special\n' > "$source"
+    PRODUCT_NAME=$'Odoo "Admin"\\\t\n\r\001 UTF-8 á'
+    PRODUCT_VERSION=$'test\\2'
+
+    archive_create "$archive" special "$source" || return 1
+    archive_manifest "$archive" |
+        python3 -c 'import json,sys; data=json.load(sys.stdin); assert "á" in data["framework"]'
+}
+
+make_test_archive() {
+    local archive="$1"
+    local directory="$2"
+
+    tar --create --directory="$directory" manifest.json resources |
+        zstd --quiet --stdout > "$archive"
+}
+
+test_invalid_archives() {
+    local root="${TEST_DIRECTORY}/invalid"
+    local archive
+
+    mkdir -p "$root/resources"
+    printf '{"format":"OAA","version":"1.0","resources":[]}\n' > "$root/manifest.json"
+
+    archive="${TEST_DIRECTORY}/missing-root.oaa"
+    tar --create --directory="$root" manifest.json |
+        zstd --quiet --stdout > "$archive"
+    ! archive_verify "$archive" || return 1
+
+    archive="${TEST_DIRECTORY}/invalid-manifest.oaa"
+    printf '{invalid\n' > "$root/manifest.json"
+    make_test_archive "$archive" "$root"
+    ! archive_verify "$archive" || return 1
+
+    archive="${TEST_DIRECTORY}/duplicate-manifest.oaa"
+    local duplicate_tar="${TEST_DIRECTORY}/duplicate.tar"
+    printf '{"format":"OAA","version":"1.0","resources":[]}\n' > "$root/manifest.json"
+    tar --create --file="$duplicate_tar" --directory="$root" manifest.json resources
+    tar --append --file="$duplicate_tar" --directory="$root" manifest.json
+    zstd --quiet --stdout "$duplicate_tar" > "$archive"
+    ! archive_verify "$archive" || return 1
+
+    archive="${TEST_DIRECTORY}/traversal.oaa"
+    printf '{"format":"OAA","version":"1.0","resources":[]}\n' > "$root/manifest.json"
+    tar --create --directory="$root" manifest.json resources \
+        --transform='s|^resources$|../escape|' |
+        zstd --quiet --stdout > "$archive"
+    ! archive_verify "$archive"
+}
+
+test_verification_and_publication_failure_cleanup() {
+    local verify_output="${TEST_DIRECTORY}/verify-failure.oaa"
+    local publish_output="${TEST_DIRECTORY}/publish-failure.oaa"
+
+    (
+        archive_verify() { return 1; }
+        ! archive_create \
+            "$verify_output" \
+            one "${TEST_DIRECTORY}/single file.txt"
+    ) || return 1
+
+    (
+        fs_move_no_replace() { return 1; }
+        ! archive_create \
+            "$publish_output" \
+            one "${TEST_DIRECTORY}/single file.txt"
+    ) || return 1
+
+    [[ ! -e "$verify_output" && ! -e "$publish_output" ]] &&
+        ! compgen -G "${TEST_DIRECTORY}/.verify-failure.oaa.*" >/dev/null &&
+        ! compgen -G "${TEST_DIRECTORY}/.publish-failure.oaa.*" >/dev/null
+}
+
+test_declared_resource_absent() {
+    local archive="${TEST_DIRECTORY}/declared-absent.oaa"
+    local root="${TEST_DIRECTORY}/declared-absent"
+
+    mkdir -p "$root/resources"
+    printf '%s\n' \
+        '{"format":"OAA","version":"1.0","resources":[{"name":"lost","source":"/x","archive_path":"resources/lost","type":"file","required":true,"included":true,"size":1,"entries":1}]}' \
+        > "$root/manifest.json"
+    make_test_archive "$archive" "$root"
+
+    ! archive_verify "$archive"
+}
+
+test_concurrent_publication() {
+    local archive="${TEST_DIRECTORY}/concurrent.oaa"
+    local status_one="${TEST_DIRECTORY}/status-one"
+    local status_two="${TEST_DIRECTORY}/status-two"
+
+    (archive_create "$archive" one "${TEST_DIRECTORY}/single file.txt"; echo $? > "$status_one") &
+    local pid_one=$!
+    (archive_create "$archive" two "${TEST_DIRECTORY}/source two"; echo $? > "$status_two") &
+    local pid_two=$!
+    wait "$pid_one"
+    wait "$pid_two"
+
+    [[ $(( $(<"$status_one") + $(<"$status_two") )) -eq 1 ]] &&
+        archive_verify "$archive"
 }
 
 setup
@@ -232,10 +336,17 @@ run_test "backs up directories and resources from different paths" \
     test_create_directory_and_multiple_sources
 run_test "records a missing optional resource" test_optional_missing
 run_test "rejects a missing required resource" test_required_missing
+run_test "diagnoses a missing required resource" test_required_missing_diagnostic
 run_test "does not overwrite an existing output" test_existing_output
+run_test "escapes JSON special characters and UTF-8" test_json_special_characters
 run_test "lists, reads, verifies and extracts a valid OAA" \
     test_list_manifest_verify_extract
 run_test "rejects a corrupt archive" test_corrupt_archive
+run_test "rejects structurally invalid archives" test_invalid_archives
+run_test "rejects a declared but absent resource" test_declared_resource_absent
+run_test "publishes only one concurrent archive" test_concurrent_publication
+run_test "cleans after verification and publication failures" \
+    test_verification_and_publication_failure_cleanup
 run_test "cleans temporary files after tar failure" test_tar_failure_cleanup
 run_test "cleans temporary files after zstd failure" test_zstd_failure_cleanup
 run_test "does not call fs_copy to stage resources" test_no_staged_resource_copy
