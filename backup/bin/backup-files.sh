@@ -10,7 +10,7 @@
 set -uo pipefail
 
 # ============================================================
-# Informaci髇 del M骴ulo
+# Informaci贸n del M贸dulo
 # ============================================================
 
 readonly MODULE_NAME="backup-files"
@@ -30,7 +30,7 @@ log_init
 
 config_load_all
 # ============================================================
-# Configuraci髇
+# Configuraci贸n
 # ============================================================
 
 config_load system
@@ -39,9 +39,13 @@ config_load files
 
 config_require \
     ODOO_CONFIG_DIR \
+    ODOO_CONFIG_REQUIRED \
     ODOO_FILESTORE_DIR \
+    ODOO_FILESTORE_REQUIRED \
     ODOO_ADDONS_DIR \
+    ODOO_ADDONS_REQUIRED \
     ODOO_ADMIN_DIR \
+    ODOO_ADMIN_REQUIRED \
     BACKUP_ROOT \
     DAILY_DIR \
     WEEKLY_DIR \
@@ -54,7 +58,7 @@ config_require \
     RETENTION_MONTHLY
 
 # ============================================================
-# Variables de Ejecuci髇
+# Variables de Ejecuci贸n
 # ============================================================
 
 declare BACKUP_FILE=""
@@ -66,46 +70,29 @@ declare BACKUP_FILE=""
 log_section "${PRODUCT_NAME} - ${MODULE_NAME}"
 
 log_info "Producto : ${PRODUCT_NAME} ${PRODUCT_VERSION}"
-log_info "M骴ulo   : ${MODULE_NAME} ${MODULE_VERSION}"
+log_info "M贸dulo   : ${MODULE_NAME} ${MODULE_VERSION}"
 
-log_ok "Configuraci髇 cargada."
+log_ok "Configuraci贸n cargada."
 
 # ============================================================
-# Verificaci髇 del Entorno
+# Verificaci贸n del Entorno
 # ============================================================
 
 check_environment() {
 
     log_section "Entorno"
 
-    local resource
-    local path
-
-    while (( $# > 0 )); do
-
-        resource="$1"
-        path="$2"
-
-        if ! fs_exists "$path"; then
-
-            log_error "No existe el recurso."
-
-            log_error "$resource : $path"
-
-            exit 1
-
-        fi
-
-        shift 2
-
-    done
+    archive_check_environment || {
+        log_error "GNU tar o zstd no est谩n disponibles."
+        exit 1
+    }
 
     log_ok "Entorno verificado."
 
 }
 
 # ============================================================
-# Verificaci髇 de Permisos
+# Verificaci贸n de Permisos
 # ============================================================
 
 check_permissions() {
@@ -159,10 +146,11 @@ create_backup() {
 
     archive_create \
         "$BACKUP_FILE" \
-        config    "$ODOO_CONFIG_DIR" \
-        filestore "$ODOO_FILESTORE_DIR" \
-        addons    "$ODOO_ADDONS_DIR" \
-        admin     "$ODOO_ADMIN_DIR" || {
+        --descriptors \
+        config    "$ODOO_CONFIG_DIR"    "$ODOO_CONFIG_REQUIRED" \
+        filestore "$ODOO_FILESTORE_DIR" "$ODOO_FILESTORE_REQUIRED" \
+        addons    "$ODOO_ADDONS_DIR"    "$ODOO_ADDONS_REQUIRED" \
+        admin     "$ODOO_ADMIN_DIR"     "$ODOO_ADMIN_REQUIRED" || {
 
         log_error "No fue posible generar el respaldo."
 
@@ -172,17 +160,17 @@ create_backup() {
 
     log_ok "Respaldo generado."
 
-    log_info "Tama駉 : $(numfmt --to=iec "$(fs_size "$BACKUP_FILE")")"
+    log_info "Tama帽o : $(numfmt --to=iec "$(fs_size "$BACKUP_FILE")")"
 
 }
 
 # ============================================================
-# Rotaci髇 de Respaldos
+# Rotaci贸n de Respaldos
 # ============================================================
 
 rotate_backups() {
 
-    log_section "Rotaci髇"
+    log_section "Rotaci贸n"
 
     if is_weekly_backup_day; then
 
@@ -192,7 +180,7 @@ rotate_backups() {
 
     else
 
-        log_skip "Hoy no corresponde rotaci髇 semanal."
+        log_skip "Hoy no corresponde rotaci贸n semanal."
 
     fi
 
@@ -204,11 +192,11 @@ rotate_backups() {
 
     else
 
-        log_skip "Hoy no corresponde rotaci髇 mensual."
+        log_skip "Hoy no corresponde rotaci贸n mensual."
 
     fi
 
-    log_ok "Rotaci髇 finalizada."
+    log_ok "Rotaci贸n finalizada."
 
 }
 
@@ -258,25 +246,25 @@ is_monthly_backup_day() {
 }
 
 # ============================================================
-# Retenci髇 de Respaldos
+# Retenci贸n de Respaldos
 # ============================================================
 
 prune_backups() {
 
-    log_section "Retenci髇"
+    log_section "Retenci贸n"
 
     #
     # Respaldos diarios
     #
 
-    log_info "Aplicando retenci髇 diaria..."
+    log_info "Aplicando retenci贸n diaria..."
 
     fs_prune \
         "$DAILY_DIR" \
         "${BACKUP_PREFIX}_*.oaa" \
         "$RETENTION_DAILY" || {
 
-        log_error "No fue posible aplicar la retenci髇 diaria."
+        log_error "No fue posible aplicar la retenci贸n diaria."
 
         exit 1
 
@@ -286,14 +274,14 @@ prune_backups() {
     # Respaldos semanales
     #
 
-    log_info "Aplicando retenci髇 semanal..."
+    log_info "Aplicando retenci贸n semanal..."
 
     fs_prune \
         "$WEEKLY_DIR" \
         "${BACKUP_PREFIX}_*.oaa" \
         "$RETENTION_WEEKLY" || {
 
-        log_error "No fue posible aplicar la retenci髇 semanal."
+        log_error "No fue posible aplicar la retenci贸n semanal."
 
         exit 1
 
@@ -303,20 +291,20 @@ prune_backups() {
     # Respaldos mensuales
     #
 
-    log_info "Aplicando retenci髇 mensual..."
+    log_info "Aplicando retenci贸n mensual..."
 
     fs_prune \
         "$MONTHLY_DIR" \
         "${BACKUP_PREFIX}_*.oaa" \
         "$RETENTION_MONTHLY" || {
 
-        log_error "No fue posible aplicar la retenci髇 mensual."
+        log_error "No fue posible aplicar la retenci贸n mensual."
 
         exit 1
 
     }
 
-    log_ok "Retenci髇 finalizada."
+    log_ok "Retenci贸n finalizada."
 
 }
 
@@ -329,20 +317,16 @@ main() {
     log_section "${PRODUCT_NAME} - ${MODULE_NAME}"
 
     log_info "Producto : ${PRODUCT_NAME} ${PRODUCT_VERSION}"
-    log_info "M骴ulo   : ${MODULE_NAME} ${MODULE_VERSION}"
+    log_info "M贸dulo   : ${MODULE_NAME} ${MODULE_VERSION}"
 
     #
-    # Verificaci髇 del Entorno
+    # Verificaci贸n del Entorno
     #
 
-    check_environment \
-        config    "$ODOO_CONFIG_DIR" \
-        filestore "$ODOO_FILESTORE_DIR" \
-        addons    "$ODOO_ADDONS_DIR" \
-        admin     "$ODOO_ADMIN_DIR"
+    check_environment
 
     #
-    # Verificaci髇 del Sistema
+    # Verificaci贸n del Sistema
     #
 
     check_permissions
@@ -354,13 +338,13 @@ main() {
     create_backup
 
     #
-    # Rotaci髇
+    # Rotaci贸n
     #
 
     rotate_backups
 
     #
-    # Retenci髇
+    # Retenci贸n
     #
 
     prune_backups

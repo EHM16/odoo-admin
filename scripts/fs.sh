@@ -61,7 +61,7 @@ fs_is_writable() {
 }
 
 # ============================================================
-# Información
+# InformaciÃ³n
 # ============================================================
 
 fs_exists() {
@@ -70,7 +70,7 @@ fs_exists() {
 
     _fs_check_arguments "$path" || return 1
 
-    [[ -e "$path" ]]
+    [[ -e "$path" || -L "$path" ]]
 
 }
 
@@ -80,7 +80,11 @@ fs_size() {
 
     _fs_check_arguments "$path" || return 1
 
-    if [[ -d "$path" ]]; then
+    if [[ -L "$path" ]]; then
+
+        stat -c %s "$path"
+
+    elif [[ -d "$path" ]]; then
 
         du -sb "$path" | cut -f1
 
@@ -113,7 +117,11 @@ fs_entries() {
 
     _fs_check_arguments "$path" || return 1
 
-    if [[ -d "$path" ]]; then
+    if [[ -L "$path" ]]; then
+
+        echo 1
+
+    elif [[ -d "$path" ]]; then
 
         find "$path" \
             -mindepth 1 \
@@ -133,7 +141,11 @@ fs_type() {
 
     _fs_check_arguments "$path" || return 1
 
-    if [[ -d "$path" ]]; then
+    if [[ -L "$path" ]]; then
+
+        echo "symlink"
+
+    elif [[ -d "$path" ]]; then
 
         echo "directory"
 
@@ -152,7 +164,7 @@ fs_type() {
 }
 
 # ============================================================
-# Búsqueda
+# BÃºsqueda
 # ============================================================
 
 fs_list() {
@@ -240,6 +252,51 @@ fs_tempdir() {
 
 }
 
+fs_tempdir_in() {
+
+    local directory="${1:-}"
+    local template="${2:-}"
+
+    _fs_check_arguments "$directory" "$template" || return 1
+
+    mktemp \
+        --directory \
+        --tmpdir="$directory" \
+        "$template"
+
+}
+
+fs_tempfile_in() {
+
+    local directory="${1:-}"
+    local template="${2:-}"
+
+    _fs_check_arguments "$directory" "$template" || return 1
+
+    mktemp \
+        --tmpdir="$directory" \
+        "$template"
+
+}
+
+fs_move_no_replace() {
+
+    local source="${1:-}"
+    local destination="${2:-}"
+
+    _fs_check_arguments "$source" "$destination" || return 1
+    fs_exists "$destination" && return 1
+
+    mv \
+        --no-clobber \
+        -T \
+        "$source" \
+        "$destination" || return 1
+
+    ! fs_exists "$source" && fs_exists "$destination"
+
+}
+
 # ============================================================
 # Respaldos
 # ============================================================
@@ -265,7 +322,7 @@ fs_backup_filename() {
 
 }
 # ============================================================
-# Retención
+# RetenciÃ³n
 # ============================================================
 
 fs_prune() {
