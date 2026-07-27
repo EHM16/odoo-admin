@@ -285,15 +285,16 @@ fs_move_no_replace() {
     local destination="${2:-}"
 
     _fs_check_arguments "$source" "$destination" || return 1
-    fs_exists "$destination" && return 1
+    # link(2) creates the destination atomically and fails with EEXIST when a
+    # concurrent publisher wins. The caller creates source beside destination,
+    # so both paths are guaranteed to be on the same filesystem.
+    ln -- "$source" "$destination" || return 1
+    rm -- "$source" || {
+        rm -- "$destination"
+        return 1
+    }
 
-    mv \
-        --no-clobber \
-        -T \
-        "$source" \
-        "$destination" || return 1
-
-    ! fs_exists "$source" && fs_exists "$destination"
+    fs_exists "$destination"
 
 }
 
