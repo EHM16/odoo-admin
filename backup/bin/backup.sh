@@ -105,23 +105,41 @@ _backup_log_summary() {
 
 }
 
-_backup_signal_number() {
+_backup_signal_exit_code() {
 
     case "${1:-}" in
-        HUP) printf '%s' 1 ;;
-        INT) printf '%s' 2 ;;
-        TERM) printf '%s' 15 ;;
+        HUP) printf '%s' 129 ;;
+        INT) printf '%s' 130 ;;
+        TERM) printf '%s' 143 ;;
         *) return 1 ;;
     esac
+
+}
+
+_backup_exit_if_signalled() {
+
+    local signal_exit_code
+
+    [[ -n "$RECEIVED_SIGNAL" ]] || return 0
+
+    signal_exit_code=$(_backup_signal_exit_code "$RECEIVED_SIGNAL") ||
+        exit "$BACKUP_EXIT_INTERNAL"
+    exit "$signal_exit_code"
 
 }
 
 _backup_handle_signal() {
 
     local signal="${1:-}"
+    local signal_exit_code
+
     [[ -z "$RECEIVED_SIGNAL" ]] || return
+
+    # Ignore subsequent managed signals before doing any cancellation work.
+    # Restoring the default here could terminate the parent before it has
+    # waited for the active process group.
+    trap '' HUP INT TERM
     RECEIVED_SIGNAL="$signal"
-    trap - HUP INT TERM
 
     log_warn "Backup job interrupted by signal ${signal}."
 
@@ -130,7 +148,15 @@ _backup_handle_signal() {
         # to that group so the script and all descendants receive the signal,
         # without touching unrelated processes.
         kill -s "$signal" -- "-${ACTIVE_CHILD_PID}" 2>/dev/null || true
+        return
     fi
+
+    # With no active child there is nothing to reap. Exiting from the handler
+    # closes the lock descriptor, if already acquired, and prevents any normal
+    # result classification or summary.
+    signal_exit_code=$(_backup_signal_exit_code "$signal") ||
+        exit "$BACKUP_EXIT_INTERNAL"
+    exit "$signal_exit_code"
 
 }
 
@@ -167,14 +193,16 @@ _backup_run_component() {
 
     local component="${1:-}"
     local child_status
-    local signal_number
-
     [[ -n "$component" ]] || return 1
+    _backup_exit_if_signalled
 
     # setsid (from util-linux, already required for flock) isolates the
     # asynchronous component in a dedicated session and process group.
-    # ACTIVE_CHILD_PID is therefore both the child PID and its PGID.
-    setsid --wait "$component" &
+    # ACTIVE_CHILD_PID is therefore both the child PID and its PGID. Bash
+    # starts asynchronous jobs with SIGINT ignored in non-interactive shells;
+    # restore the managed signals before exec so forwarding reaches the script
+    # and every descendant as intended.
+    env --default-signal=HUP,INT,TERM setsid --wait "$component" &
     ACTIVE_CHILD_PID=$!
 
     wait "$ACTIVE_CHILD_PID"
@@ -185,9 +213,7 @@ _backup_run_component() {
         # job while still ensuring the signalled process group has terminated.
         wait "$ACTIVE_CHILD_PID" 2>/dev/null || true
         ACTIVE_CHILD_PID=""
-        signal_number=$(_backup_signal_number "$RECEIVED_SIGNAL") ||
-            exit "$BACKUP_EXIT_INTERNAL"
-        exit "$(( 128 + signal_number ))"
+        _backup_exit_if_signalled
     fi
 
     ACTIVE_CHILD_PID=""
@@ -216,20 +242,24 @@ main() {
 
     # Traps are deliberately installed only after the logger is initialized.
     _backup_install_signal_handlers
+    _backup_exit_if_signalled
 
     log_section "${PRODUCT_NAME} - ${MODULE_NAME}"
     log_info "Product : ${PRODUCT_NAME} ${PRODUCT_VERSION}"
     log_info "Module  : ${MODULE_NAME} ${MODULE_VERSION}"
 
-    _backup_validate_components || {
+    if ! _backup_validate_components; then
+        _backup_exit_if_signalled
         end_time=$SECONDS
         duration=$(_backup_format_duration "$(( end_time - start_time ))")
         _backup_log_summary "$BACKUP_RESULT_INTERNAL_ERROR" "$BACKUP_EXIT_INTERNAL" "$duration"
         return "$BACKUP_EXIT_INTERNAL"
-    }
+    fi
+    _backup_exit_if_signalled
 
     fs_lock_acquire "$BACKUP_LOCK_FILE" BACKUP_LOCK_FD
     lock_status=$?
+    _backup_exit_if_signalled
 
     if (( lock_status == 1 )); then
         end_time=$SECONDS
@@ -256,6 +286,7 @@ main() {
     fi
     component_end=$SECONDS
     DB_DURATION=$(_backup_format_duration "$(( component_end - component_start ))")
+    _backup_exit_if_signalled
 
     component_start=$SECONDS
     if _backup_run_component "$BACKUP_FILES_SCRIPT"; then
@@ -265,6 +296,7 @@ main() {
     fi
     component_end=$SECONDS
     FILES_DURATION=$(_backup_format_duration "$(( component_end - component_start ))")
+    _backup_exit_if_signalled
 
     if [[ "$DB_STATUS" == "$BACKUP_STATUS_OK" && "$FILES_STATUS" == "$BACKUP_STATUS_OK" ]]; then
         result="$BACKUP_RESULT_COMPLETE"
@@ -279,10 +311,13 @@ main() {
 
     end_time=$SECONDS
     duration=$(_backup_format_duration "$(( end_time - start_time ))")
+    _backup_exit_if_signalled
     _backup_log_summary "$result" "$exit_code" "$duration"
 
     return "$exit_code"
 
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

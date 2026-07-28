@@ -218,13 +218,23 @@ señal; no se elimina normalmente el archivo ni se requiere un *unlock*
 explícito.
 
 El orquestador maneja explícitamente `SIGINT`, `SIGTERM` y `SIGHUP`. Cada
-componente se ejecuta en un grupo de procesos propio; al recibir una señal, el
-orquestador la registra y la reenvía al grupo activo para terminar también sus
-descendientes. Después espera su terminación, omite el resumen normal y sale
-con la convención Unix: `130` para `SIGINT`, `143` para `SIGTERM` y `129` para
-`SIGHUP`. Estos códigos no forman parte de la API normal `0`–`4`; representan
-una terminación externa. El manejo de `SIGTERM` queda preparado para una futura
-integración con systemd.
+componente se ejecuta en una sesión y un grupo de procesos propios mediante
+`setsid --wait`. Antes de ejecutarlo se restaura la disposición predeterminada
+de esas señales, incluso para `SIGINT` en shells Bash no interactivos. Al
+recibir una señal, el orquestador la registra una sola vez y la reenvía
+únicamente al grupo activo para terminar también sus descendientes. El padre
+espera la terminación del grupo fuera del trap y después sale con la convención
+Unix: `130` para `SIGINT`, `143` para `SIGTERM` y `129` para `SIGHUP`.
+
+Si no existe un componente activo, la señal termina inmediatamente el
+orquestador con el mismo código. Además, se comprueba el estado de cancelación
+en cada transición crítica: después de instalar los traps, validar los
+componentes y adquirir el lock; entre ambos respaldos; después del segundo
+componente; y antes de clasificar o resumir el resultado. Una cancelación nunca
+inicia el componente siguiente ni produce un resumen normal `COMPLETE`,
+`FAILED` o `PARTIAL`. Los códigos por señal no forman parte de la API normal
+`0`–`4`; representan una terminación externa. El manejo de `SIGTERM` queda
+preparado para una futura integración con systemd.
 
 Los timeouts, la programación mediante cron y las unidades o timers de systemd
 pertenecen a fases posteriores y todavía no forman parte del proyecto.
