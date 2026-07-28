@@ -194,8 +194,10 @@ operativa, y el éxito se determina exclusivamente por sus códigos de retorno.
 
 La política no es *fail-fast*: si el respaldo de base de datos falla, el
 respaldo de archivos todavía se ejecuta. Al final se registra un resumen con el
-estado de ambos componentes, la duración total, el resultado global y el
-código:
+estado y la duración individual de ambos componentes, la duración total, el
+resultado global y el código. Las duraciones usan segundos monotónicos del
+propio proceso y el formato `HH:MM:SS`; un componente no ejecutado muestra
+`NOT_RUN`, nunca una duración ambigua de cero.
 
 | Código | Resultado |
 |---:|---|
@@ -210,10 +212,32 @@ ejecución un bloqueo `flock` no bloqueante sobre
 `/run/lock/odoo-admin-backup.lock`. La ruta puede ajustarse con
 `BACKUP_LOCK_FILE` en `config/backup.conf`. El archivo de lock puede persistir:
 la exclusión depende del descriptor abierto, que el sistema cierra al terminar
-el proceso.
+el proceso. El descriptor permanece abierto mientras termina el componente
+activo y el lock se libera automáticamente al finalizar, incluso ante una
+señal; no se elimina normalmente el archivo ni se requiere un *unlock*
+explícito.
 
-La programación mediante unidades y timers de systemd pertenece a una fase
-posterior y todavía no forma parte del proyecto.
+El orquestador maneja explícitamente `SIGINT`, `SIGTERM` y `SIGHUP`. Cada
+componente se ejecuta en un grupo de procesos propio; al recibir una señal, el
+orquestador la registra y la reenvía al grupo activo para terminar también sus
+descendientes. Después espera su terminación, omite el resumen normal y sale
+con la convención Unix: `130` para `SIGINT`, `143` para `SIGTERM` y `129` para
+`SIGHUP`. Estos códigos no forman parte de la API normal `0`–`4`; representan
+una terminación externa. El manejo de `SIGTERM` queda preparado para una futura
+integración con systemd.
+
+Los timeouts, la programación mediante cron y las unidades o timers de systemd
+pertenecen a fases posteriores y todavía no forman parte del proyecto.
+
+Los resúmenes usan la API genérica del logger:
+
+```bash
+log_key_value "Database duration" "00:00:31"
+```
+
+`log_key_value` recibe exactamente una clave y un valor no vacíos, admite
+espacios en ambos argumentos, aplica una alineación estable y escribe mediante
+el flujo normal del logger, incluida la salida al logfile configurado.
 
 ## Requisitos
 

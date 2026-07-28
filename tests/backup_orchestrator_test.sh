@@ -102,8 +102,10 @@ test_result_matrix() {
 
             [[ "$status" == "$expected" ]] || return 1
             [[ $(wc -l < "$marker") == 2 ]] || return 1
-            grep -q "Exit code ....... ${expected}" "$output" || return 1
-            grep -Eq 'Duration \.{8} [0-9]{2}:[0-9]{2}:[0-9]{2}' "$output" || return 1
+            grep -Eq "Exit code \\. +${expected}$|Exit code \\.+ ${expected}$" "$output" || return 1
+            grep -Eq 'Database duration \.+ [0-9]{2}:[0-9]{2}:[0-9]{2}' "$output" || return 1
+            grep -Eq 'Filesystem duration \.+ [0-9]{2}:[0-9]{2}:[0-9]{2}' "$output" || return 1
+            grep -Eq 'Total duration \.+ [0-9]{2}:[0-9]{2}:[0-9]{2}' "$output" || return 1
         done
     done
 }
@@ -124,9 +126,11 @@ test_summary_states() {
     set -e
 
     [[ "$status" == 2 ]] &&
-        grep -q 'Database ........ ERROR' "$output" &&
-        grep -q 'Filesystem ...... OK' "$output" &&
-        grep -q 'Result .......... PARTIAL' "$output"
+        grep -Eq 'Database \.+ ERROR' "$output" &&
+        grep -Eq 'Filesystem \.+ OK' "$output" &&
+        grep -Eq 'Database duration \.+ [0-9]{2}:[0-9]{2}:[0-9]{2}' "$output" &&
+        grep -Eq 'Filesystem duration \.+ [0-9]{2}:[0-9]{2}:[0-9]{2}' "$output" &&
+        grep -Eq 'Result \.+ PARTIAL' "$output"
 }
 
 test_missing_components_are_internal_error() {
@@ -147,9 +151,11 @@ test_missing_components_are_internal_error() {
     set -e
 
     [[ "$status" == 4 ]] &&
-        grep -q 'Database ........ NOT_RUN' "$output" &&
-        grep -q 'Filesystem ...... NOT_RUN' "$output" &&
-        grep -q 'Result .......... INTERNAL_ERROR' "$output"
+        grep -Eq 'Database \.+ NOT_RUN' "$output" &&
+        grep -Eq 'Filesystem \.+ NOT_RUN' "$output" &&
+        grep -Eq 'Database duration \.+ NOT_RUN' "$output" &&
+        grep -Eq 'Filesystem duration \.+ NOT_RUN' "$output" &&
+        grep -Eq 'Result \.+ INTERNAL_ERROR' "$output"
 }
 
 test_lock_error_is_internal() {
@@ -172,7 +178,7 @@ test_lock_error_is_internal() {
     set -e
 
     [[ "$status" == 4 ]] &&
-        grep -q 'Result .......... INTERNAL_ERROR' "$output"
+        grep -Eq 'Result \.+ INTERNAL_ERROR' "$output"
 }
 
 test_concurrent_execution_and_lock_release() {
@@ -219,7 +225,7 @@ test_concurrent_execution_and_lock_release() {
 
     [[ "$second_status" == 3 ]] || return 1
     [[ ! -e "$marker" ]] || return 1
-    grep -q 'Result .......... REJECTED' "$output_two" || return 1
+    grep -Eq 'Result \.+ REJECTED' "$output_two" || return 1
 
     touch "$release"
     set +e
@@ -265,6 +271,158 @@ test_no_residual_children() {
         ! kill -0 "$(<"$files_pid")" 2>/dev/null
 }
 
+test_log_key_value() {
+    local directory="${TEST_DIRECTORY}/logger"
+    local output="${directory}/output"
+    local logfile="${directory}/logger.log"
+
+    mkdir -p "$directory"
+
+    (
+        LOG_DIRECTORY="$directory"
+        LOG_FILE="$logfile"
+        # shellcheck source=../scripts/logger.sh
+        source "${TEST_ROOT}/scripts/logger.sh"
+        log_init
+        log_key_value "Key with spaces" "value with spaces"
+        ! log_key_value "missing value"
+    ) >"$output" 2>&1 || return 1
+
+    grep -Eq 'Key with spaces \.+ value with spaces' "$output" &&
+        grep -Eq 'Key with spaces \.+ value with spaces' "$logfile"
+}
+
+make_interruptible_component() {
+    local path="$1"
+    local ready="$2"
+    local parent_pid="$3"
+    local descendant_pid="$4"
+    local parent_signal="$5"
+    local descendant_signal="$6"
+
+    mkdir -p "$(dirname -- "$path")"
+    {
+        printf '%s\n' '#!/usr/bin/env bash'
+        printf '%s\n' 'set -uo pipefail'
+        printf 'trap '\''printf "signal\\n" > %q; exit 0'\'' HUP INT TERM\n' "$parent_signal"
+        printf 'printf "%%s\\n" "$$" > %q\n' "$parent_pid"
+        printf '(\n'
+        printf '    trap '\''printf "signal\\n" > %q; exit 0'\'' HUP INT TERM\n' "$descendant_signal"
+        printf '    printf "%%s\\n" "$BASHPID" > %q\n' "$descendant_pid"
+        printf '    while :; do read -r -t 1 _ </dev/null || true; done\n'
+        printf ') &\n'
+        printf 'descendant=$!\n'
+        printf 'printf "ready\\n" > %q\n' "$ready"
+        printf 'wait "$descendant"\n'
+    } >"$path"
+    chmod +x "$path"
+}
+
+test_signal_interrupt() {
+    local signal="$1"
+    local expected_status="$2"
+    local directory="${TEST_DIRECTORY}/signal-${signal}"
+    local db_script="${directory}/db"
+    local files_script="${directory}/files"
+    local output="${directory}/output"
+    local ready="${directory}/ready"
+    local parent_pid_file="${directory}/parent.pid"
+    local descendant_pid_file="${directory}/descendant.pid"
+    local parent_signal="${directory}/parent.signal"
+    local descendant_signal="${directory}/descendant.signal"
+    local lock_file="${directory}/lock"
+    local status
+    local parent_pid
+    local descendant_pid
+
+    make_interruptible_component \
+        "$db_script" "$ready" "$parent_pid_file" "$descendant_pid_file" \
+        "$parent_signal" "$descendant_signal"
+    make_component "$files_script" 0
+
+    status=$(
+        python3 - \
+            "$ORCHESTRATOR" "$db_script" "$files_script" "$lock_file" \
+            "$output" "$ready" "$descendant_pid_file" "$signal" \
+            "${TEST_DIRECTORY}/logs" <<'PY'
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+(orchestrator, db_script, files_script, lock_file, output,
+ ready, descendant_pid, signal_name, log_directory) = sys.argv[1:]
+environment = os.environ.copy()
+environment.update({
+    "LOG_DIRECTORY": log_directory,
+    "BACKUP_DB_SCRIPT": db_script,
+    "BACKUP_FILES_SCRIPT": files_script,
+    "BACKUP_LOCK_FILE": lock_file,
+})
+if signal_name == "INT":
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+process_pid = os.fork()
+if process_pid == 0:
+    os.setsid()
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    output_fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.dup2(output_fd, 1)
+    os.dup2(output_fd, 2)
+    os.close(output_fd)
+    os.execve(orchestrator, [orchestrator], environment)
+
+deadline = time.monotonic() + 10
+while not (Path(ready).exists() and Path(descendant_pid).exists()):
+    finished, status = os.waitpid(process_pid, os.WNOHANG)
+    if finished:
+        raise SystemExit("orchestrator exited before its component was ready")
+    if time.monotonic() >= deadline:
+        os.kill(process_pid, signal.SIGKILL)
+        os.waitpid(process_pid, 0)
+        raise SystemExit("component readiness marker timed out")
+    time.sleep(0.01)
+
+os.kill(process_pid, getattr(signal, f"SIG{signal_name}"))
+_, wait_status = os.waitpid(process_pid, 0)
+return_code = os.waitstatus_to_exitcode(wait_status)
+print(return_code)
+PY
+    ) || return 1
+
+    parent_pid=$(<"$parent_pid_file")
+    descendant_pid=$(<"$descendant_pid_file")
+
+    [[ "$status" == "$expected_status" ]] || return 1
+    [[ -e "$parent_signal" && -e "$descendant_signal" ]] || return 1
+    ! kill -0 "$parent_pid" 2>/dev/null || return 1
+    ! kill -0 "$descendant_pid" 2>/dev/null || return 1
+    grep -q "interrupted by signal ${signal}" "$output" || return 1
+    ! grep -Eq 'Result \.+ (COMPLETE|FAILED|PARTIAL)' "$output" || return 1
+
+    make_component "$db_script" 0
+    set +e
+    run_orchestrator \
+        "$db_script" "$files_script" "$lock_file" "${directory}/after.out"
+    status=$?
+    set -e
+
+    [[ "$status" == 0 ]]
+}
+
+test_sigint() {
+    test_signal_interrupt INT 130
+}
+
+test_sigterm() {
+    test_signal_interrupt TERM 143
+}
+
+test_sighup() {
+    test_signal_interrupt HUP 129
+}
+
 setup
 
 run_test "result matrix, non fail-fast execution, exit codes, spaces, cwd and duration" \
@@ -275,5 +433,9 @@ run_test "locking initialization failure returns internal error" test_lock_error
 run_test "concurrent execution is rejected and lock is released" \
     test_concurrent_execution_and_lock_release
 run_test "component processes do not remain after completion" test_no_residual_children
+run_test "log_key_value handles spaces and uses normal logger output" test_log_key_value
+run_test "SIGTERM terminates the child tree, releases the lock and returns 143" test_sigterm
+run_test "SIGHUP terminates the child tree, releases the lock and returns 129" test_sighup
+run_test "SIGINT terminates the child tree, releases the lock and returns 130" test_sigint
 
 printf '1..%d\n' "$TEST_COUNT"

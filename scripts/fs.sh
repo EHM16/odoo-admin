@@ -327,6 +327,10 @@ fs_lock_acquire() {
     [[ "$descriptor_variable" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || return 2
     command -v flock >/dev/null 2>&1 || return 2
 
+    # The returned descriptor must remain open for the complete protected
+    # operation. flock releases the lock automatically when that descriptor is
+    # closed or the process exits; the persistent lock file is normally kept,
+    # so callers do not need an explicit unlock in their normal flow.
     exec {descriptor}>"$lock_file" || return 2
 
     flock --nonblock "$descriptor"

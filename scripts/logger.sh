@@ -10,7 +10,7 @@
 set -uo pipefail
 
 # ============================================================
-# Configuración
+# ConfiguraciÃ³n
 # ============================================================
 
 LOG_DIRECTORY="${LOG_DIRECTORY:-/opt/odoo-admin/logs}"
@@ -22,6 +22,7 @@ LOG_DATE_FORMAT="${LOG_DATE_FORMAT:-%Y-%m-%d %H:%M:%S}"
 # ============================================================
 
 readonly LOG_SEPARATOR="============================================================"
+readonly LOG_KEY_WIDTH=25
 
 readonly LOG_LEVEL_INFO="INFO"
 readonly LOG_LEVEL_OK="OK"
@@ -42,7 +43,7 @@ readonly COLOR_ERROR="\033[1;31m"
 readonly COLOR_SKIP="\033[1;36m"
 
 # ============================================================
-# Inicialización
+# InicializaciÃ³n
 # ============================================================
 
 log_init() {
@@ -140,7 +141,7 @@ _log() {
 }
 
 # ============================================================
-# API Pública
+# API PÃºblica
 # ============================================================
 
 #
@@ -181,6 +182,25 @@ log_skip() {
 # Utilidades
 #
 
+log_key_value() {
+
+    local key="${1:-}"
+    local value="${2:-}"
+    local padding
+    local padding_width
+
+    (( $# == 2 )) || return 1
+    [[ -n "$key" && -n "$value" ]] || return 1
+
+    padding_width=$(( LOG_KEY_WIDTH - ${#key} ))
+    (( padding_width < 1 )) && padding_width=1
+    printf -v padding '%*s' "$padding_width" ''
+    padding=${padding// /.}
+
+    log_info "${key} ${padding} ${value}"
+
+}
+
 log_blank() {
 
     printf "\n"
@@ -220,7 +240,7 @@ log_section() {
 }
 
 # ============================================================
-# Inicialización
+# InicializaciÃ³n
 # ============================================================
 
 log_init() {
