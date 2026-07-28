@@ -398,8 +398,12 @@ while not (Path(ready).exists() and Path(descendant_pid).exists()
     time.sleep(0.01)
 
 component_pid = int(Path(parent_pid_file).read_text())
+component_pgid = os.getpgid(component_pid)
+component_sid = os.getsid(component_pid)
+if component_pgid == os.getpgid(process_pid):
+    raise SystemExit("component group unexpectedly includes orchestrator")
 Path(identity_file).write_text(
-    f"{component_pid}\n{os.getpgid(component_pid)}\n{os.getsid(component_pid)}\n"
+    f"{component_pid}\n{component_pgid}\n{component_sid}\n"
 )
 os.kill(process_pid, getattr(signal, f"SIG{signal_name}"))
 _, wait_status = os.waitpid(process_pid, 0)
