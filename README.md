@@ -178,6 +178,77 @@ El destino, prefijo, formato de fecha y políticas de retención se configuran e
 el mismo archivo. La aplicación valida primero las dependencias y permisos,
 crea el OAA diario y después aplica las rotaciones semanal y mensual.
 
+## Orquestador de respaldo
+
+`backup/bin/backup.sh` es el punto de entrada oficial para ejecutar manualmente
+un trabajo completo:
+
+```bash
+/opt/odoo-admin/backup/bin/backup.sh
+```
+
+El orquestador coordina, en este orden, `backup-db.sh` y `backup-files.sh`. No
+duplica la creación, rotación ni retención de sus respaldos. La salida de ambos
+componentes se hereda directamente para conservar toda la información
+operativa, y el éxito se determina exclusivamente por sus códigos de retorno.
+
+La política no es *fail-fast*: si el respaldo de base de datos falla, el
+respaldo de archivos todavía se ejecuta. Al final se registra un resumen con el
+estado y la duración individual de ambos componentes, la duración total, el
+resultado global y el código. Las duraciones usan segundos monotónicos del
+propio proceso y el formato `HH:MM:SS`; un componente no ejecutado muestra
+`NOT_RUN`, nunca una duración ambigua de cero.
+
+| Código | Resultado |
+|---:|---|
+| `0` | Ambos componentes terminaron correctamente |
+| `1` | Ambos componentes fallaron |
+| `2` | Sólo uno de los componentes terminó correctamente |
+| `3` | Ejecución rechazada porque otro respaldo está en curso |
+| `4` | Error interno previo a la ejecución de los componentes |
+
+Para impedir trabajos simultáneos, `backup.sh` mantiene durante toda la
+ejecución un bloqueo `flock` no bloqueante sobre
+`/run/lock/odoo-admin-backup.lock`. La ruta puede ajustarse con
+`BACKUP_LOCK_FILE` en `config/backup.conf`. El archivo de lock puede persistir:
+la exclusión depende del descriptor abierto, que el sistema cierra al terminar
+el proceso. El descriptor permanece abierto mientras termina el componente
+activo y el lock se libera automáticamente al finalizar, incluso ante una
+señal; no se elimina normalmente el archivo ni se requiere un *unlock*
+explícito.
+
+El orquestador maneja explícitamente `SIGINT`, `SIGTERM` y `SIGHUP`. Cada
+componente se ejecuta en una sesión y un grupo de procesos propios mediante
+`setsid --wait`. Antes de ejecutarlo se restaura la disposición predeterminada
+de esas señales, incluso para `SIGINT` en shells Bash no interactivos. Al
+recibir una señal, el orquestador la registra una sola vez y la reenvía
+únicamente al grupo activo para terminar también sus descendientes. El padre
+espera la terminación del grupo fuera del trap y después sale con la convención
+Unix: `130` para `SIGINT`, `143` para `SIGTERM` y `129` para `SIGHUP`.
+
+Si no existe un componente activo, la señal termina inmediatamente el
+orquestador con el mismo código. Además, se comprueba el estado de cancelación
+en cada transición crítica: después de instalar los traps, validar los
+componentes y adquirir el lock; entre ambos respaldos; después del segundo
+componente; y antes de clasificar o resumir el resultado. Una cancelación nunca
+inicia el componente siguiente ni produce un resumen normal `COMPLETE`,
+`FAILED` o `PARTIAL`. Los códigos por señal no forman parte de la API normal
+`0`–`4`; representan una terminación externa. El manejo de `SIGTERM` queda
+preparado para una futura integración con systemd.
+
+Los timeouts, la programación mediante cron y las unidades o timers de systemd
+pertenecen a fases posteriores y todavía no forman parte del proyecto.
+
+Los resúmenes usan la API genérica del logger:
+
+```bash
+log_key_value "Database duration" "00:00:31"
+```
+
+`log_key_value` recibe exactamente una clave y un valor no vacíos, admite
+espacios en ambos argumentos, aplica una alineación estable y escribe mediante
+el flujo normal del logger, incluida la salida al logfile configurado.
+
 ## Requisitos
 
 - Debian o un sistema compatible;
@@ -185,13 +256,14 @@ crea el OAA diario y después aplica las rotaciones semanal y mensual.
 - GNU tar con soporte para zstd;
 - zstd;
 - Python 3;
+- `flock`, provisto por `util-linux`;
 - utilidades GNU habituales (`stat`, `find`, `numfmt`, entre otras);
 
 Instalación de las dependencias principales en Debian:
 
 ```bash
 sudo apt update
-sudo apt install bash tar zstd python3
+sudo apt install bash tar zstd python3 util-linux
 ```
 
 ## Pruebas
@@ -205,6 +277,7 @@ fallos de TAR o zstd y ausencia de staging mediante `fs_copy`.
 
 ```bash
 bash tests/archive_test.sh
+bash tests/backup_orchestrator_test.sh
 ```
 
 Si zstd no está instalado, la suite usa exclusivamente dentro del entorno de
